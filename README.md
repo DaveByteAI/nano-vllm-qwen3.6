@@ -63,13 +63,13 @@ editable install is enough.
 Keep model weights outside the repository. The examples assume `~/huggingface`.
 
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3.5-9B \
+hf download Qwen/Qwen3.5-9B \
   --local-dir ~/huggingface/Qwen3.5-9B \
-  --local-dir-use-symlinks False
+  --max-workers 8
 
-huggingface-cli download --resume-download Qwen/Qwen3.6-27B-FP8 \
+hf download Qwen/Qwen3.6-27B-FP8 \
   --local-dir ~/huggingface/Qwen3.6-27B-FP8 \
-  --local-dir-use-symlinks False
+  --max-workers 8
 ```
 
 Do not commit model weights, generated caches, local images, or benchmark logs.
