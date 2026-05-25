@@ -1,6 +1,7 @@
 import pickle
 import torch
 import torch.distributed as dist
+import torch._dynamo
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -34,6 +35,8 @@ def _create_model(hf_config, vision_config=None):
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
