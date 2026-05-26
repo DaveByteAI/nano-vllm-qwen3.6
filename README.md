@@ -169,7 +169,7 @@ python test_mtp_spec_decode.py \
 
 This prototype groups draft verification into batch-level accept/reject accounting. `--verify-mode graph` captures verify-length buckets 1-4 as CUDA graphs, so each verify call replays the internal sequential decode steps through one graph. This reduces Python/launch overhead, but it is not a fused parallel GDN verify kernel.
 
-`--verify-mode chunk` is an experimental continuation-prefill verifier. It computes logits for the draft chunk in one verify call and supports accept/reject state restore, while Qwen3.6 GDN layers still use a recurrent fallback internally for correctness. This mode is for studying chunk-verify semantics first, not for speed yet.
+`--verify-mode chunk` is an experimental continuation-prefill verifier. It runs a chunk probe first, then restores the decode state and uses the trusted graph/eager verify path to make accept/reject and state-commit decisions so greedy output stays aligned. Chunk verify-length buckets 1-4 are captured as CUDA graphs when CUDA Graph is enabled. The raw chunk logits are still compared against the trusted path and may differ, so this mode is for studying chunk-verify semantics and overhead before a fused GDN chunk kernel.
 
 Fast-path MTP decode benchmark without top-k/logit-diff probes:
 

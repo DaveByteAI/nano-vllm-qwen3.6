@@ -100,6 +100,7 @@ def run_greedy(args, prompt):
 
 def ensure_block_capacity(llm, seq, context_len):
     block_manager = llm.scheduler.block_manager
+    sync_full_block_hashes(llm, seq, len(seq))
     needed_blocks = (context_len + seq.block_size - 1) // seq.block_size
     while len(seq.block_table) < needed_blocks:
         if not block_manager.free_block_ids:
@@ -107,6 +108,51 @@ def ensure_block_capacity(llm, seq, context_len):
         block_id = block_manager.free_block_ids[0]
         block_manager._allocate_block(block_id)
         seq.block_table.append(block_id)
+
+
+def sync_full_block_hashes(llm, seq, context_len):
+    if not seq.block_table:
+        return
+    block_manager = llm.scheduler.block_manager
+    full_blocks = min(context_len, len(seq)) // seq.block_size
+    full_blocks = min(full_blocks, len(seq.block_table))
+    prefix = -1
+    for block_idx in range(full_blocks):
+        block_id = seq.block_table[block_idx]
+        block = block_manager.blocks[block_id]
+        token_ids = seq.block(block_idx)
+        if len(token_ids) != seq.block_size:
+            break
+        if block_idx > 0:
+            prefix = block_manager.blocks[seq.block_table[block_idx - 1]].hash
+        if block.hash != -1 and block.token_ids == token_ids:
+            prefix = block.hash
+            continue
+        if block.hash != -1 and block_manager.hash_to_block_id.get(block.hash) == block_id:
+            del block_manager.hash_to_block_id[block.hash]
+        h = block_manager.compute_hash(token_ids, prefix)
+        block.update(h, token_ids)
+        block_manager.hash_to_block_id[h] = block_id
+        prefix = h
+
+
+def trim_block_table_to_context(llm, seq, context_len):
+    block_manager = llm.scheduler.block_manager
+    needed_blocks = (context_len + seq.block_size - 1) // seq.block_size
+    while len(seq.block_table) > needed_blocks:
+        block_id = seq.block_table.pop()
+        block = block_manager.blocks[block_id]
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            block_manager._deallocate_block(block_id)
+
+
+def finalize_manual_commit(llm, seq):
+    if not seq.block_table:
+        return
+    processed_context_len = max(len(seq) - 1, 0)
+    sync_full_block_hashes(llm, seq, processed_context_len)
+    trim_block_table_to_context(llm, seq, processed_context_len)
 
 
 def commit_tokens(llm, seq, token_ids):
@@ -117,7 +163,29 @@ def commit_tokens(llm, seq, token_ids):
             break
         llm.scheduler.postprocess([seq], [token_id], False)
         committed.append(token_id)
+    finalize_manual_commit(llm, seq)
     return committed
+
+
+def trusted_verify_mode(args):
+    return "eager" if args.verify_mode == "eager" else "graph"
+
+
+def record_verify_call(stats, verify, verify_len, seconds):
+    stats["verify_call_seconds"] += seconds
+    if verify["verify_mode_used"] == "graph":
+        stats["verify_graph_replays"] += 1
+    elif verify["verify_mode_used"] == "chunk":
+        stats["verify_chunk_calls"] += 1
+        if verify.get("chunk_graph_replay"):
+            stats["chunk_graph_replays"] += 1
+    else:
+        stats["verify_eager_calls"] += 1
+    stats["target_forwards"] += verify_len
+    if verify["verify_mode_used"] == "chunk":
+        stats["chunk_forwards"] += verify_len
+    else:
+        stats["decode_forwards"] += verify_len
 
 
 def run_speculative(args, tokenizer, prompt):
@@ -141,6 +209,11 @@ def run_speculative(args, tokenizer, prompt):
         "verify_graph_replays": 0,
         "verify_eager_calls": 0,
         "verify_chunk_calls": 0,
+        "chunk_graph_replays": 0,
+        "chunk_forwards": 0,
+        "chunk_checked_batches": 0,
+        "chunk_token_mismatches": 0,
+        "chunk_max_logit_diff": 0.0,
         "max_verify_batch_size": 0,
         "accept_length_total": 0,
         "max_accept_length": 0,
@@ -151,6 +224,8 @@ def run_speculative(args, tokenizer, prompt):
         "reject_rerun_input_tokens": 0,
         "main_call_seconds": 0.0,
         "verify_call_seconds": 0.0,
+        "chunk_call_seconds": 0.0,
+        "trusted_verify_call_seconds": 0.0,
         "rerun_call_seconds": 0.0,
     }
     generated_tokens = 0
@@ -191,10 +266,12 @@ def run_speculative(args, tokenizer, prompt):
                 "draft_token_ids": list(draft_token_ids),
                 "verify_input_ids": [],
                 "target_token_ids": [],
+                "chunk_token_ids": [],
                 "accept_len": 0,
                 "reject_index": None,
                 "committed_after_main": [],
                 "verify_mode_used": None,
+                "chunk_max_logit_diff": None,
             }
 
         if generated_tokens <= args.verbose_steps:
@@ -246,18 +323,47 @@ def run_speculative(args, tokenizer, prompt):
             None,
             args.verify_mode,
         )
-        stats["verify_call_seconds"] += perf_counter() - call_started
+        verify_seconds = perf_counter() - call_started
+        record_verify_call(stats, verify, verify_len, verify_seconds)
+        if verify["verify_mode_used"] == "chunk":
+            stats["chunk_call_seconds"] += verify_seconds
+        else:
+            stats["trusted_verify_call_seconds"] += verify_seconds
+
+        if args.verify_mode == "chunk":
+            chunk_verify = verify
+            restore_scheduler(llm, seq, scheduler_snapshot)
+            llm.model_runner.call("restore_decode_state", snapshot_name)
+            call_started = perf_counter()
+            verify = llm.model_runner.call(
+                "run_verify_auto_probe",
+                [seq],
+                verify_input_ids,
+                start_pos,
+                args.top_k,
+                None,
+                snapshot_name,
+                trusted_verify_mode(args),
+            )
+            verify_seconds = perf_counter() - call_started
+            record_verify_call(stats, verify, verify_len, verify_seconds)
+            stats["trusted_verify_call_seconds"] += verify_seconds
+            stats["chunk_checked_batches"] += 1
+            stats["chunk_token_mismatches"] += sum(
+                int(a != b) for a, b in zip(chunk_verify["token_ids"], verify["token_ids"])
+            )
+            if verify["max_logit_diff"] is not None:
+                stats["chunk_max_logit_diff"] = max(
+                    stats["chunk_max_logit_diff"],
+                    verify["max_logit_diff"],
+                )
+            if trace is not None:
+                event["chunk_token_ids"] = list(chunk_verify["token_ids"])
+                event["chunk_max_logit_diff"] = verify["max_logit_diff"]
+
         stats["verify_batches"] += 1
         stats["verify_batch_tokens"] += verify_len
-        if verify["verify_mode_used"] == "graph":
-            stats["verify_graph_replays"] += 1
-        elif verify["verify_mode_used"] == "chunk":
-            stats["verify_chunk_calls"] += 1
-        else:
-            stats["verify_eager_calls"] += 1
         stats["draft_token_attempts"] += verify_len
-        stats["target_forwards"] += verify_len
-        stats["decode_forwards"] += verify_len
         stats["max_verify_batch_size"] = max(stats["max_verify_batch_size"], verify_len)
 
         target_token_ids = verify["token_ids"]
@@ -306,16 +412,15 @@ def run_speculative(args, tokenizer, prompt):
                 start_pos,
                 args.top_k,
                 None,
-                snapshot_name,
-                args.verify_mode,
+                None if args.verify_mode == "chunk" else snapshot_name,
+                trusted_verify_mode(args),
             )
-            stats["rerun_call_seconds"] += perf_counter() - call_started
+            rerun_seconds = perf_counter() - call_started
+            stats["rerun_call_seconds"] += rerun_seconds
             stats["reject_reruns"] += 1
             stats["reject_rerun_input_tokens"] += len(rerun_input_ids)
             if rerun["verify_mode_used"] == "graph":
                 stats["verify_graph_replays"] += 1
-            elif rerun["verify_mode_used"] == "chunk":
-                stats["verify_chunk_calls"] += 1
             else:
                 stats["verify_eager_calls"] += 1
             stats["target_forwards"] += len(rerun_input_ids)
@@ -409,6 +514,7 @@ def print_mismatch_debug(tokenizer, greedy_ids, spec_ids, spec_stats, window):
 def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
     generated = max(len(spec_ids), 1)
     attempts = max(spec_stats["compared_tokens"], 1)
+    batches = max(spec_stats["verify_batches"], 1)
     accepted = spec_stats["accepted_tokens"]
     accept_rate = accepted / attempts
     avg_verify_batch_size = (
@@ -439,6 +545,11 @@ def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
     print(f"verify_graph_replays: {spec_stats['verify_graph_replays']}", flush=True)
     print(f"verify_eager_calls: {spec_stats['verify_eager_calls']}", flush=True)
     print(f"verify_chunk_calls: {spec_stats['verify_chunk_calls']}", flush=True)
+    print(f"chunk_graph_replays: {spec_stats['chunk_graph_replays']}", flush=True)
+    print(f"chunk_forwards: {spec_stats['chunk_forwards']}", flush=True)
+    print(f"chunk_checked_batches: {spec_stats['chunk_checked_batches']}", flush=True)
+    print(f"chunk_token_mismatches: {spec_stats['chunk_token_mismatches']}", flush=True)
+    print(f"chunk_max_logit_diff: {spec_stats['chunk_max_logit_diff']:.6f}", flush=True)
     print(f"avg_verify_batch_size: {avg_verify_batch_size:.3f}", flush=True)
     print(f"max_verify_batch_size: {spec_stats['max_verify_batch_size']}", flush=True)
     print(f"draft_token_attempts: {spec_stats['draft_token_attempts']}", flush=True)
@@ -464,6 +575,20 @@ def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
         print(f"greedy_target_forwards: {greedy_stats['target_forwards']}", flush=True)
         print(f"extra_target_forwards_vs_greedy: {delta}", flush=True)
         print(f"extra_target_forwards_per_token: {delta / generated:.3f}", flush=True)
+    print(f"main_call_seconds: {spec_stats['main_call_seconds']:.4f}", flush=True)
+    print(f"main_call_seconds_per_token: {spec_stats['main_call_seconds'] / generated:.4f}", flush=True)
+    print(f"verify_call_seconds: {spec_stats['verify_call_seconds']:.4f}", flush=True)
+    print(f"verify_call_seconds_per_token: {spec_stats['verify_call_seconds'] / generated:.4f}", flush=True)
+    print(f"verify_call_seconds_per_batch: {spec_stats['verify_call_seconds'] / batches:.4f}", flush=True)
+    print(f"chunk_call_seconds: {spec_stats['chunk_call_seconds']:.4f}", flush=True)
+    print(f"trusted_verify_call_seconds: {spec_stats['trusted_verify_call_seconds']:.4f}", flush=True)
+    print(f"rerun_call_seconds: {spec_stats['rerun_call_seconds']:.4f}", flush=True)
+    if spec_stats["reject_reruns"]:
+        print(
+            f"rerun_call_seconds_per_rerun: "
+            f"{spec_stats['rerun_call_seconds'] / spec_stats['reject_reruns']:.4f}",
+            flush=True,
+        )
     print(f"spec_model_call_seconds: {spec_stats['model_call_seconds']:.4f}", flush=True)
     print(f"spec_model_call_seconds_per_token: {spec_stats['model_call_seconds'] / generated:.4f}", flush=True)
     if greedy_stats is not None:

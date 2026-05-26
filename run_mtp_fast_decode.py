@@ -6,7 +6,13 @@ from time import perf_counter
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 from test_state_rollback import restore_scheduler, snapshot_scheduler
-from test_mtp_spec_decode import build_prompt, decode_text, ensure_block_capacity
+from test_mtp_spec_decode import (
+    build_prompt,
+    decode_text,
+    ensure_block_capacity,
+    finalize_manual_commit,
+    trusted_verify_mode,
+)
 
 
 def parse_args():
@@ -62,6 +68,7 @@ def commit_tokens(llm, seq, token_ids):
             break
         llm.scheduler.postprocess([seq], [token_id], False)
         committed.append(token_id)
+    finalize_manual_commit(llm, seq)
     return committed
 
 
@@ -108,6 +115,9 @@ def run_mtp_fast_decode(args, prompt):
         "verify_graph_replays": 0,
         "verify_eager_calls": 0,
         "verify_chunk_calls": 0,
+        "chunk_graph_replays": 0,
+        "chunk_checked_batches": 0,
+        "chunk_token_mismatches": 0,
         "accept_length_total": 0,
         "compared_tokens": 0,
         "reject_reruns": 0,
@@ -162,7 +172,8 @@ def run_mtp_fast_decode(args, prompt):
             start_pos,
             args.verify_mode,
         )
-        stats["verify_call_seconds"] += perf_counter() - call_started
+        verify_seconds = perf_counter() - call_started
+        stats["verify_call_seconds"] += verify_seconds
         stats["verify_batches"] += 1
         stats["verify_batch_tokens"] += verify_len
         stats["draft_token_attempts"] += verify_len
@@ -171,8 +182,33 @@ def run_mtp_fast_decode(args, prompt):
             stats["verify_graph_replays"] += 1
         elif verify["verify_mode_used"] == "chunk":
             stats["verify_chunk_calls"] += 1
+            if verify.get("chunk_graph_replay"):
+                stats["chunk_graph_replays"] += 1
         else:
             stats["verify_eager_calls"] += 1
+
+        if args.verify_mode == "chunk":
+            chunk_verify = verify
+            restore_scheduler(llm, seq, scheduler_snapshot)
+            llm.model_runner.call("restore_decode_state", snapshot_name)
+            call_started = perf_counter()
+            verify = llm.model_runner.call(
+                "run_verify_batch_fast",
+                [seq],
+                verify_input_ids,
+                start_pos,
+                trusted_verify_mode(args),
+            )
+            stats["verify_call_seconds"] += perf_counter() - call_started
+            stats["target_forwards"] += verify_len
+            if verify["verify_mode_used"] == "graph":
+                stats["verify_graph_replays"] += 1
+            else:
+                stats["verify_eager_calls"] += 1
+            stats["chunk_checked_batches"] += 1
+            stats["chunk_token_mismatches"] += sum(
+                int(a != b) for a, b in zip(chunk_verify["token_ids"], verify["token_ids"])
+            )
 
         target_token_ids = verify["token_ids"]
         accept_len = 0
@@ -204,7 +240,7 @@ def run_mtp_fast_decode(args, prompt):
                 [seq],
                 rerun_input_ids,
                 start_pos,
-                args.verify_mode,
+                trusted_verify_mode(args),
             )
             stats["rerun_call_seconds"] += perf_counter() - call_started
             stats["reject_reruns"] += 1
@@ -212,8 +248,6 @@ def run_mtp_fast_decode(args, prompt):
             stats["target_forwards"] += len(rerun_input_ids)
             if rerun["verify_mode_used"] == "graph":
                 stats["verify_graph_replays"] += 1
-            elif rerun["verify_mode_used"] == "chunk":
-                stats["verify_chunk_calls"] += 1
             else:
                 stats["verify_eager_calls"] += 1
             commit_tokens(llm, seq, draft_token_ids[:accept_len] + [rerun["token_ids"][-1]])
@@ -244,6 +278,9 @@ def summarize_stats(token_count, stats):
         "verify_graph_replays": stats.get("verify_graph_replays", 0),
         "verify_eager_calls": stats.get("verify_eager_calls", 0),
         "verify_chunk_calls": stats.get("verify_chunk_calls", 0),
+        "chunk_graph_replays": stats.get("chunk_graph_replays", 0),
+        "chunk_checked_batches": stats.get("chunk_checked_batches", 0),
+        "chunk_token_mismatches": stats.get("chunk_token_mismatches", 0),
         "reject_reruns": stats.get("reject_reruns", 0),
     }
 

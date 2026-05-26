@@ -105,6 +105,8 @@ class ModelRunner:
             del self.graphs, self.graph_pool
             if hasattr(self, "verify_graphs"):
                 del self.verify_graphs, self.verify_graph_vars
+            if hasattr(self, "verify_chunk_graphs"):
+                del self.verify_chunk_graphs, self.verify_chunk_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -911,6 +913,16 @@ class ModelRunner:
         save_logits_as: str | None = None,
         compare_logits_to: str | None = None,
     ):
+        verify_len = len(input_token_ids)
+        if not self.enforce_eager and hasattr(self, "verify_chunk_graphs") and verify_len in self.verify_chunk_graphs:
+            return self._run_verify_chunk_graph_probe(
+                seqs,
+                input_token_ids,
+                start_pos,
+                top_k,
+                save_logits_as,
+                compare_logits_to,
+            )
         input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_verify_chunk(
             seqs,
             input_token_ids,
@@ -940,6 +952,81 @@ class ModelRunner:
             "verify_len": len(input_token_ids),
             "context_len": start_pos + len(input_token_ids),
             "verify_mode_used": "chunk",
+            "chunk_graph_replay": False,
+        }
+
+    def _copy_verify_chunk_graph_inputs(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+    ):
+        assert len(seqs) == 1, "chunk verify graph currently supports batch size 1"
+        assert input_token_ids, "chunk verify graph needs at least one input token"
+        seq = seqs[0]
+        verify_len = len(input_token_ids)
+        assert input_token_ids[0] == seq.last_token
+        context_len = start_pos + verify_len
+        needed_blocks = (context_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks
+
+        vars = self.verify_chunk_graph_vars[verify_len]
+        vars["input_ids"].copy_(torch.tensor(input_token_ids, dtype=torch.int64, device="cuda"), non_blocking=True)
+        vars["positions"].copy_(
+            torch.arange(start_pos, start_pos + verify_len, dtype=torch.int64, device="cuda"),
+            non_blocking=True,
+        )
+        vars["cu_seqlens_k"][1] = context_len
+        vars["slot_mapping"].copy_(
+            torch.tensor(
+                self._kv_slots_for_positions(seq, start_pos, verify_len),
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            non_blocking=True,
+        )
+        vars["block_tables"].fill_(-1)
+        vars["block_tables"][:, :needed_blocks].copy_(
+            torch.tensor([seq.block_table[:needed_blocks]], dtype=torch.int32, device="cuda"),
+            non_blocking=True,
+        )
+        if self.config.is_hybrid:
+            vars["state_indices"][0] = seq.state_slot_id
+        return vars, verify_len, context_len
+
+    @torch.inference_mode()
+    def _run_verify_chunk_graph_probe(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+        top_k: int = 5,
+        save_logits_as: str | None = None,
+        compare_logits_to: str | None = None,
+    ):
+        vars, verify_len, context_len = self._copy_verify_chunk_graph_inputs(seqs, input_token_ids, start_pos)
+        self.verify_chunk_graphs[verify_len].replay()
+        reset_context()
+        logits = self.model.compute_logits(vars["outputs"][:verify_len])
+        logits_float = logits.float()
+        token_ids = self.sample(logits, None, greedy=True)
+        topk = self.topk_tokens(logits, top_k)
+        max_logit_diff = self._compare_logits(logits_float, compare_logits_to)
+
+        if save_logits_as is not None:
+            self.logit_probe_refs[save_logits_as] = logits_float.detach().clone()
+
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "topk": topk,
+            "logits_shape": tuple(logits_float.shape),
+            "max_logit_diff": max_logit_diff,
+            "verify_len": verify_len,
+            "context_len": context_len,
+            "verify_mode_used": "chunk",
+            "chunk_graph_replay": True,
         }
 
     @torch.inference_mode()
@@ -1045,6 +1132,21 @@ class ModelRunner:
         input_token_ids: list[int],
         start_pos: int,
     ):
+        verify_len = len(input_token_ids)
+        if not self.enforce_eager and hasattr(self, "verify_chunk_graphs") and verify_len in self.verify_chunk_graphs:
+            vars, _, _ = self._copy_verify_chunk_graph_inputs(seqs, input_token_ids, start_pos)
+            self.verify_chunk_graphs[verify_len].replay()
+            reset_context()
+            logits = self.model.compute_logits(vars["outputs"][:verify_len])
+            token_ids = self.sample(logits, None, greedy=True)
+
+            if self.rank != 0:
+                return None
+            return {
+                "token_ids": token_ids,
+                "verify_mode_used": "chunk",
+                "chunk_graph_replay": True,
+            }
         input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_verify_chunk(
             seqs,
             input_token_ids,
@@ -1062,6 +1164,7 @@ class ModelRunner:
         return {
             "token_ids": token_ids,
             "verify_mode_used": "chunk",
+            "chunk_graph_replay": False,
         }
 
     @torch.inference_mode()
@@ -1335,6 +1438,7 @@ class ModelRunner:
             self.reset_gdn_state_slots(list(range(max_bs)))
         if config.enable_mtp:
             self.capture_verify_cudagraph()
+            self.capture_verify_chunk_cudagraph()
 
     @torch.inference_mode()
     def capture_verify_cudagraph(self):
@@ -1379,6 +1483,58 @@ class ModelRunner:
             )
             if state_indices is not None:
                 self.verify_graph_vars[verify_len]["state_indices"] = state_indices
+            torch.cuda.synchronize()
+            reset_context()
+            if config.is_hybrid:
+                self.reset_gdn_state_slots([0])
+
+    @torch.inference_mode()
+    def capture_verify_chunk_cudagraph(self):
+        config = self.config
+        hf_config = config.hf_config
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        self.verify_chunk_graphs = {}
+        self.verify_chunk_graph_vars = {}
+
+        for verify_len in self.verify_graph_lens:
+            input_ids = torch.zeros(verify_len, dtype=torch.int64)
+            positions = torch.arange(verify_len, dtype=torch.int64)
+            cu_seqlens_q = torch.tensor([0, verify_len], dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, verify_len], dtype=torch.int32)
+            slot_mapping = torch.arange(verify_len, dtype=torch.int32)
+            block_tables = torch.zeros(1, max_num_blocks, dtype=torch.int32)
+            state_indices = torch.zeros(1, dtype=torch.int32) if config.is_hybrid else None
+            outputs = torch.zeros(verify_len, hf_config.hidden_size)
+
+            def run_verify_chunk():
+                set_context(
+                    True,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    verify_len,
+                    config.max_model_len,
+                    slot_mapping,
+                    None,
+                    block_tables,
+                    state_indices=state_indices,
+                )
+                outputs[:] = self.model(input_ids, positions)
+
+            run_verify_chunk()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                run_verify_chunk()
+            self.verify_chunk_graphs[verify_len] = graph
+            self.verify_chunk_graph_vars[verify_len] = dict(
+                input_ids=input_ids,
+                positions=positions,
+                cu_seqlens_k=cu_seqlens_k,
+                slot_mapping=slot_mapping,
+                block_tables=block_tables,
+                outputs=outputs,
+            )
+            if state_indices is not None:
+                self.verify_chunk_graph_vars[verify_len]["state_indices"] = state_indices
             torch.cuda.synchronize()
             reset_context()
             if config.is_hybrid:

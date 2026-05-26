@@ -212,13 +212,17 @@ class GatedDeltaNet(nn.Module):
         conv_weight = self.conv1d.weight
         outputs = []
         warmup = state_indices is None or self.conv_states.numel() == 0
+        continuation = not warmup and context.block_tables is not None
+
+        if continuation and num_seqs == 1:
+            return self._forward_prefill_recurrent_indexed(hidden_states.unsqueeze(0), state_indices).squeeze(0)
 
         for i in range(num_seqs):
             start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
             seq_len = end - start
 
             x = hidden_states[start:end].unsqueeze(0)          # [1, L, H]
-            if not warmup and context.block_tables is not None:
+            if continuation:
                 si = state_indices[i].item()
                 outputs.append(self._forward_prefill_recurrent(x, si).squeeze(0))
                 continue
@@ -262,6 +266,41 @@ class GatedDeltaNet(nn.Module):
             outputs.append(out.squeeze(0))
 
         return torch.cat(outputs, dim=0)
+
+    def _forward_prefill_recurrent_indexed(self, x, state_indices: torch.Tensor):
+        outputs = []
+        for t in range(x.size(1)):
+            x_t = x[:, t:t + 1]
+            mixed_qkv = self.in_proj_qkv(x_t).transpose(1, 2)
+            z = self.in_proj_z(x_t)
+            b = self.in_proj_b(x_t)
+            a = self.in_proj_a(x_t)
+
+            conv_state = self.conv_states[state_indices]
+            mixed_qkv, new_conv_state = causal_conv1d_decode(mixed_qkv, self.conv1d.weight, conv_state)
+            self.conv_states[state_indices] = new_conv_state
+
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            q, k, v = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = q.reshape(1, 1, self.num_k_heads, self.head_k_dim)
+            k = k.reshape(1, 1, self.num_k_heads, self.head_k_dim)
+            v = v.reshape(1, 1, self.num_v_heads, self.head_v_dim)
+
+            beta = b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            if self.gqa_ratio > 1:
+                q = q.repeat_interleave(self.gqa_ratio, dim=2)
+                k = k.repeat_interleave(self.gqa_ratio, dim=2)
+
+            rec_state = self.recurrent_states[state_indices]
+            out = recurrent_gated_delta_rule(q, k, v, g, beta, rec_state)
+            self.recurrent_states[state_indices] = rec_state
+
+            z_flat = z.reshape(-1, self.head_v_dim)
+            out = self.norm(out.reshape(-1, self.head_v_dim), z_flat)
+            out = self.out_proj(out.reshape(1, 1, self.value_dim))
+            outputs.append(out)
+        return torch.cat(outputs, dim=1)
 
     def _forward_prefill_recurrent(self, x, state_index: int):
         outputs = []
