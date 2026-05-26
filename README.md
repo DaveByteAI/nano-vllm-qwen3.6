@@ -137,7 +137,7 @@ Qwen3.5 single-prompt timing helper:
 python bench_qwen35_fixed.py \
   --model ~/huggingface/Qwen3.5-9B \
   --tp 4 \
-  --max-tokens 128 \
+  --max-tokens 256 \
   --repeats 3
 ```
 
