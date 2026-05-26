@@ -52,7 +52,12 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self._log("creating model")
         self.model = _create_model(hf_config, vision_config=config.vision_config)
-        load_model(self.model, config.model, log_fn=self._log)
+        self.load_result = load_model(self.model, config.model, log_fn=self._log)
+        if config.enable_mtp:
+            mtp_skipped = [name for name in self.load_result.skipped_names if name.startswith("mtp.")]
+            mtp_loaded = [name for name in self.load_result.loaded_names if name.startswith("mtp.")]
+            assert not mtp_skipped, f"MTP weights were skipped: {mtp_skipped[:8]}"
+            self._log(f"mtp weights loaded: {len(mtp_loaded)} tensors")
         self.sampler = Sampler()
         # Store multimodal config
         self.image_token_id = config.image_token_id
@@ -195,6 +200,16 @@ class ModelRunner:
         for layer in gdn_layers:
             layer.conv_states = torch.zeros(max_slots, conv_dim, kernel_size - 1, dtype=hf_config.dtype, device="cuda")
             layer.recurrent_states = torch.zeros(max_slots, num_v_heads, head_k_dim, head_v_dim, dtype=torch.float32, device="cuda")
+
+    def reset_gdn_state_slots(self, slot_ids: list[int]):
+        if not self.config.is_hybrid or not slot_ids:
+            return
+        from nanovllm.layers.gated_delta_net import GatedDeltaNet
+        indices = torch.tensor(slot_ids, dtype=torch.long, device="cuda")
+        for layer in self.model.modules():
+            if isinstance(layer, GatedDeltaNet):
+                layer.conv_states.index_fill_(0, indices, 0)
+                layer.recurrent_states.index_fill_(0, indices, 0)
 
     def allocate_runtime_buffers(self):
         """Preallocate small staging tensors used on every decode step."""
@@ -432,6 +447,29 @@ class ModelRunner:
         rank_ids = scores.argmax(dim=0, keepdim=True)
         return token_ids.gather(0, rank_ids).squeeze(0).tolist()
 
+    def topk_tokens(self, logits: torch.Tensor, k: int):
+        k = min(k, logits.size(-1))
+        values, token_ids = torch.topk(logits.float(), k, dim=-1)
+        token_ids = token_ids + self.model.lm_head.vocab_start_idx
+        if self.world_size > 1:
+            all_values = [torch.empty_like(values) for _ in range(self.world_size)]
+            all_token_ids = [torch.empty_like(token_ids) for _ in range(self.world_size)]
+            dist.all_gather(all_values, values)
+            dist.all_gather(all_token_ids, token_ids)
+            if self.rank != 0:
+                return None
+            values = torch.cat(all_values, dim=-1)
+            token_ids = torch.cat(all_token_ids, dim=-1)
+            values, indices = torch.topk(values, k, dim=-1)
+            token_ids = token_ids.gather(1, indices)
+        return [
+            [
+                {"token_id": int(token_id), "score": float(score)}
+                for token_id, score in zip(row_ids, row_values)
+            ]
+            for row_ids, row_values in zip(token_ids.tolist(), values.tolist())
+        ]
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool,
                   pixel_values=None, image_grid_thw=None, image_token_mask=None):
@@ -541,15 +579,22 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    @torch.inference_mode()
-    def run_mtp_probe(self, seqs: list[Sequence]):
+    def _run_mtp_draft(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        top_k: int = 5,
+    ):
         assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
         assert len(seqs) == 1, "MTP probe currently supports batch size 1"
 
-        input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
-        assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
-            "MTP probe is text-only"
-        assert positions.ndim == 1, "MTP probe expects 1D text positions"
+        if is_prefill:
+            input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
+            assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+                "MTP probe is text-only"
+            assert positions.ndim == 1, "MTP probe expects 1D text positions"
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
 
         hidden_states = self.model(
             input_ids,
@@ -559,8 +604,13 @@ class ModelRunner:
             image_token_mask=None,
         )
         context = get_context()
-        last_indices = context.cu_seqlens_q[1:] - 1
-        main_hidden = hidden_states[last_indices].contiguous()
+        if is_prefill:
+            last_indices = context.cu_seqlens_q[1:] - 1
+            main_hidden = hidden_states[last_indices].contiguous()
+            mtp_positions = positions[last_indices].contiguous() + 1
+        else:
+            main_hidden = hidden_states
+            mtp_positions = positions.contiguous() + 1
         logits = self.model.compute_logits(hidden_states)
         main_token_ids = self.sample(logits, None, greedy=True)
 
@@ -571,7 +621,6 @@ class ModelRunner:
             dist.broadcast(main_token_tensor, src=0)
 
         inputs_embeds = self.model.model.embed_tokens(main_token_tensor)
-        mtp_positions = positions[last_indices].contiguous() + 1
         cu_seqlens = torch.arange(
             main_hidden.size(0) + 1,
             dtype=torch.int32,
@@ -597,6 +646,7 @@ class ModelRunner:
         mtp_hidden = self.model.mtp(mtp_positions, main_hidden, inputs_embeds)
         draft_logits = self.model.compute_logits(mtp_hidden)
         draft_token_ids = self.sample(draft_logits, None, greedy=True)
+        draft_topk = self.topk_tokens(draft_logits, top_k)
         reset_context()
 
         if self.rank != 0:
@@ -604,10 +654,21 @@ class ModelRunner:
         return {
             "main_token_ids": main_token_ids,
             "draft_token_ids": draft_token_ids,
+            "draft_topk": draft_topk,
             "main_hidden_shape": tuple(main_hidden.shape),
             "mtp_hidden_shape": tuple(mtp_hidden.shape),
             "draft_logits_shape": tuple(draft_logits.shape),
+            "mtp_loaded_count": len([name for name in self.load_result.loaded_names if name.startswith("mtp.")]),
+            "mtp_skipped_count": len([name for name in self.load_result.skipped_names if name.startswith("mtp.")]),
         }
+
+    @torch.inference_mode()
+    def run_mtp_probe(self, seqs: list[Sequence], top_k: int = 5):
+        return self._run_mtp_draft(seqs, is_prefill=True, top_k=top_k)
+
+    @torch.inference_mode()
+    def run_mtp_draft_step(self, seqs: list[Sequence], is_prefill: bool, top_k: int = 5):
+        return self._run_mtp_draft(seqs, is_prefill=is_prefill, top_k=top_k)
 
     @torch.inference_mode()
     def capture_cudagraph(self):
