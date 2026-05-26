@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--verbose-steps", type=int, default=16)
     parser.add_argument("--force-reject-step", type=int, default=0)
     parser.add_argument("--verify-mode", choices=["eager", "graph"], default="eager")
+    parser.add_argument("--debug-mismatch", action="store_true")
+    parser.add_argument("--mismatch-window", type=int, default=8)
     parser.add_argument("--skip-greedy-compare", action="store_true")
     return parser.parse_args()
 
@@ -108,6 +110,7 @@ def ensure_block_capacity(llm, seq, context_len):
 
 
 def commit_tokens(llm, seq, token_ids):
+    ensure_block_capacity(llm, seq, len(seq) + len(token_ids))
     committed = []
     for token_id in token_ids:
         if llm.is_finished():
@@ -151,9 +154,11 @@ def run_speculative(args, tokenizer, prompt):
     }
     generated_tokens = 0
     verify_step = 0
+    trace = [] if args.debug_mismatch else None
 
     started = perf_counter()
     while not llm.is_finished():
+        output_start = seq.num_completion_tokens
         remaining = args.max_tokens - seq.num_completion_tokens
         round_draft_len = max(0, min(args.draft_len, remaining - 1))
 
@@ -176,6 +181,20 @@ def run_speculative(args, tokenizer, prompt):
         draft_token_ids = draft_result["draft_token_ids"]
         llm.scheduler.postprocess(seqs, main_token_ids, is_prefill)
         generated_tokens += len(main_token_ids)
+        event = None
+        if trace is not None:
+            event = {
+                "round": stats["draft_rounds"],
+                "output_start": output_start,
+                "main_token_ids": list(main_token_ids),
+                "draft_token_ids": list(draft_token_ids),
+                "verify_input_ids": [],
+                "target_token_ids": [],
+                "accept_len": 0,
+                "reject_index": None,
+                "committed_after_main": [],
+                "verify_mode_used": None,
+            }
 
         if generated_tokens <= args.verbose_steps:
             print(
@@ -191,16 +210,25 @@ def run_speculative(args, tokenizer, prompt):
                 )
 
         if llm.is_finished():
+            if trace is not None:
+                event["output_end"] = seq.num_completion_tokens
+                trace.append(event)
             break
 
         remaining_after_main = args.max_tokens - seq.num_completion_tokens
         draft_token_ids = draft_token_ids[:remaining_after_main]
         if not draft_token_ids:
+            if trace is not None:
+                event["output_end"] = seq.num_completion_tokens
+                trace.append(event)
             continue
 
         verify_len = len(draft_token_ids)
         start_pos = len(seq) - 1
         verify_input_ids = [seq.last_token] + draft_token_ids[:-1]
+        if trace is not None:
+            event["draft_token_ids"] = list(draft_token_ids)
+            event["verify_input_ids"] = list(verify_input_ids)
         snapshot_name = f"spec_batch_{stats['verify_batches'] + 1}"
         scheduler_snapshot = snapshot_scheduler(llm, seq)
         ensure_block_capacity(llm, seq, start_pos + verify_len)
@@ -230,6 +258,9 @@ def run_speculative(args, tokenizer, prompt):
         stats["max_verify_batch_size"] = max(stats["max_verify_batch_size"], verify_len)
 
         target_token_ids = verify["token_ids"]
+        if trace is not None:
+            event["target_token_ids"] = list(target_token_ids)
+            event["verify_mode_used"] = verify["verify_mode_used"]
         accept_len = 0
         reject_index = None
         forced_reject = False
@@ -257,6 +288,8 @@ def run_speculative(args, tokenizer, prompt):
             stats["discarded_draft_tokens"] += verify_len - accept_len - 1
             stats["wasted_verified_tokens_after_reject"] += verify_len - accept_len - 1
             rejected_target_ids = [target_token_ids[reject_index]]
+            if trace is not None:
+                event["reject_index"] = reject_index
 
             restore_scheduler(llm, seq, scheduler_snapshot)
             llm.model_runner.call("restore_decode_state", snapshot_name)
@@ -292,6 +325,11 @@ def run_speculative(args, tokenizer, prompt):
 
         llm.model_runner.call("drop_decode_state", snapshot_name)
         generated_tokens += len(committed_token_ids)
+        if trace is not None:
+            event["accept_len"] = accept_len
+            event["committed_after_main"] = list(committed_token_ids)
+            event["output_end"] = seq.num_completion_tokens
+            trace.append(event)
 
         if generated_tokens <= args.verbose_steps:
             print(
@@ -310,9 +348,53 @@ def run_speculative(args, tokenizer, prompt):
                 print(f"  reject rerun max_logit_diff={max_rerun_logit_diff}", flush=True)
 
     stats["wall_seconds"] = perf_counter() - started
+    if trace is not None:
+        stats["trace"] = trace
     token_ids = list(seq.completion_token_ids)
     close_llm(llm)
     return token_ids, stats
+
+
+def first_mismatch(left_ids, right_ids):
+    for i, (left_id, right_id) in enumerate(zip(left_ids, right_ids)):
+        if left_id != right_id:
+            return i
+    if len(left_ids) != len(right_ids):
+        return min(len(left_ids), len(right_ids))
+    return None
+
+
+def print_mismatch_debug(tokenizer, greedy_ids, spec_ids, spec_stats, window):
+    idx = first_mismatch(greedy_ids, spec_ids)
+    if idx is None:
+        return
+    start = max(0, idx - window)
+    end = min(max(len(greedy_ids), len(spec_ids)), idx + window + 1)
+    greedy_slice = greedy_ids[start:min(end, len(greedy_ids))]
+    spec_slice = spec_ids[start:min(end, len(spec_ids))]
+
+    print("\n=== MISMATCH DEBUG ===", flush=True)
+    print(f"first_mismatch_index: {idx}", flush=True)
+    print(
+        f"greedy_token: {greedy_ids[idx] if idx < len(greedy_ids) else None} "
+        f"{tokenizer.decode([greedy_ids[idx]]) if idx < len(greedy_ids) else '<missing>'!r}",
+        flush=True,
+    )
+    print(
+        f"spec_token: {spec_ids[idx] if idx < len(spec_ids) else None} "
+        f"{tokenizer.decode([spec_ids[idx]]) if idx < len(spec_ids) else '<missing>'!r}",
+        flush=True,
+    )
+    print(f"greedy_context_ids: {greedy_slice}", flush=True)
+    print(f"spec_context_ids: {spec_slice}", flush=True)
+    print(f"greedy_context: {tokenizer.decode(greedy_slice)!r}", flush=True)
+    print(f"spec_context: {tokenizer.decode(spec_slice)!r}", flush=True)
+
+    trace = spec_stats.get("trace") or []
+    for event in trace:
+        if event.get("output_start", -1) <= idx < event.get("output_end", -1):
+            print(f"trace_event: {event}", flush=True)
+            break
 
 
 def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
@@ -414,6 +496,7 @@ def main():
     print(decode_text(tokenizer, spec_ids), flush=True)
     print(f"spec_token_ids: {spec_ids}", flush=True)
     if greedy_ids is not None and greedy_ids != spec_ids:
+        print_mismatch_debug(tokenizer, greedy_ids, spec_ids, spec_stats, args.mismatch_window)
         raise SystemExit(1)
 
 

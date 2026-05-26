@@ -859,6 +859,100 @@ class ModelRunner:
             "verify_mode_used": "graph",
         }
 
+    @torch.inference_mode()
+    def run_verify_batch_fast(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+        verify_mode: str = "eager",
+    ):
+        if verify_mode == "graph" and not self.enforce_eager and hasattr(self, "verify_graphs"):
+            verify_len = len(input_token_ids)
+            if verify_len in self.verify_graphs:
+                return self._run_verify_graph_fast(seqs, input_token_ids, start_pos)
+
+        assert len(seqs) == 1, "fast verify currently supports batch size 1"
+        assert input_token_ids, "fast verify needs at least one input token"
+        seq = seqs[0]
+        verify_len = len(input_token_ids)
+        assert input_token_ids[0] == seq.last_token
+        needed_blocks = (start_pos + verify_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks
+
+        work_seq = copy(seq)
+        work_seq.token_ids = list(seq.token_ids)
+        work_seq.block_table = list(seq.block_table)
+        token_ids = []
+        for i, next_input_token_id in enumerate(input_token_ids):
+            assert work_seq.last_token == next_input_token_id
+            input_ids, positions = self.prepare_decode([work_seq])
+            logits = self.run_model(input_ids, positions, False)
+            sampled_token_ids = self.sample(logits, None, greedy=True)
+            if self.rank == 0:
+                token_ids.extend(sampled_token_ids)
+            reset_context()
+            if i != verify_len - 1:
+                work_seq.append_token(input_token_ids[i + 1])
+                work_seq.num_cached_tokens += 1
+
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "verify_mode_used": "eager",
+        }
+
+    def _run_verify_graph_fast(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+    ):
+        assert len(seqs) == 1, "verify graph currently supports batch size 1"
+        seq = seqs[0]
+        verify_len = len(input_token_ids)
+        assert input_token_ids and input_token_ids[0] == seq.last_token
+        vars = self.verify_graph_vars[verify_len]
+
+        needed_blocks = (start_pos + verify_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks
+
+        block_tables_cpu = self.verify_cpu_block_tables[:, :needed_blocks]
+        block_tables_cpu.fill_(-1)
+        for i, token_id in enumerate(input_token_ids):
+            pos = start_pos + i
+            self.verify_cpu_input_ids[i] = token_id
+            self.verify_cpu_positions[i] = pos
+            self.verify_cpu_context_lens[i] = pos + 1
+            self.verify_cpu_slot_mapping[i] = (
+                seq.block_table[pos // self.block_size] * self.block_size
+                + pos % self.block_size
+            )
+        for i, block_id in enumerate(seq.block_table[:needed_blocks]):
+            block_tables_cpu[0, i] = block_id
+
+        vars["input_ids"].copy_(self.verify_cpu_input_ids[:verify_len], non_blocking=True)
+        vars["positions"].copy_(self.verify_cpu_positions[:verify_len], non_blocking=True)
+        vars["slot_mapping"].copy_(self.verify_cpu_slot_mapping[:verify_len], non_blocking=True)
+        vars["context_lens"].copy_(self.verify_cpu_context_lens[:verify_len], non_blocking=True)
+        vars["block_tables"].fill_(-1)
+        vars["block_tables"][:, :needed_blocks].copy_(block_tables_cpu, non_blocking=True)
+        if self.config.is_hybrid:
+            self.verify_cpu_state_indices[0] = seq.state_slot_id
+            vars["state_indices"].copy_(self.verify_cpu_state_indices, non_blocking=True)
+
+        self.verify_graphs[verify_len].replay()
+        logits = self.model.compute_logits(vars["outputs"][:verify_len])
+        token_ids = self.sample(logits, None, greedy=True)
+
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "verify_mode_used": "graph",
+        }
+
     def _run_mtp_draft(
         self,
         seqs: list[Sequence],
@@ -973,6 +1067,79 @@ class ModelRunner:
     @torch.inference_mode()
     def run_mtp_draft_step(self, seqs: list[Sequence], is_prefill: bool, top_k: int = 5, draft_len: int = 1):
         return self._run_mtp_draft(seqs, is_prefill=is_prefill, top_k=top_k, draft_len=draft_len)
+
+    @torch.inference_mode()
+    def run_mtp_draft_fast_step(self, seqs: list[Sequence], is_prefill: bool, draft_len: int = 1):
+        assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
+        assert len(seqs) == 1, "MTP fast path currently supports batch size 1"
+        assert draft_len >= 0
+
+        if is_prefill:
+            input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
+            assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+                "MTP fast path is text-only"
+            assert positions.ndim == 1, "MTP fast path expects 1D text positions"
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+
+        hidden_states = self.model(input_ids, positions)
+        context = get_context()
+        if is_prefill:
+            last_indices = context.cu_seqlens_q[1:] - 1
+            main_hidden = hidden_states[last_indices].contiguous()
+            mtp_positions = positions[last_indices].contiguous() + 1
+        else:
+            main_hidden = hidden_states
+            mtp_positions = positions.contiguous() + 1
+        logits = self.model.compute_logits(hidden_states)
+        main_token_ids = self.sample(logits, None, greedy=True)
+
+        main_token_tensor = torch.empty(main_hidden.size(0), dtype=torch.int64, device="cuda")
+        if self.rank == 0:
+            main_token_tensor.copy_(torch.tensor(main_token_ids, dtype=torch.int64, device="cuda"))
+        if self.world_size > 1:
+            dist.broadcast(main_token_tensor, src=0)
+
+        current_hidden = main_hidden
+        current_positions = mtp_positions
+        current_token_tensor = main_token_tensor
+        draft_token_ids = []
+        for _ in range(draft_len):
+            inputs_embeds = self.model.model.embed_tokens(current_token_tensor)
+            cu_seqlens = torch.arange(current_hidden.size(0) + 1, dtype=torch.int32, device="cuda")
+            slot_mapping = torch.full((current_hidden.size(0),), -1, dtype=torch.int32, device="cuda")
+            set_context(
+                True,
+                cu_seqlens,
+                cu_seqlens,
+                1,
+                1,
+                slot_mapping,
+                None,
+                None,
+                state_indices=None,
+            )
+            mtp_hidden = self.model.mtp(current_positions, current_hidden, inputs_embeds)
+            draft_logits = self.model.compute_logits(mtp_hidden)
+            next_token_ids = self.sample(draft_logits, None, greedy=True)
+            next_token_tensor = torch.empty(current_hidden.size(0), dtype=torch.int64, device="cuda")
+            if self.rank == 0:
+                draft_token_ids.append(next_token_ids[0])
+                next_token_tensor.copy_(torch.tensor(next_token_ids, dtype=torch.int64, device="cuda"))
+            if self.world_size > 1:
+                dist.broadcast(next_token_tensor, src=0)
+            current_hidden = mtp_hidden
+            current_positions = current_positions + 1
+            current_token_tensor = next_token_tensor
+        reset_context()
+
+        if self.rank != 0:
+            return None
+        return {
+            "main_token_ids": main_token_ids,
+            "draft_token_ids": draft_token_ids,
+            "mtp_forwards": draft_len,
+        }
 
     @torch.inference_mode()
     def capture_cudagraph(self):
