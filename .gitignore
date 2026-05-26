@@ -212,3 +212,4 @@ huggingface/
 outputs/
 logs/
 image_demo.jpg
+uv.lock
