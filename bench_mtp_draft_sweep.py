@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument("--max-batched-tokens", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--draft-lens", default="1,2,3,4")
-    parser.add_argument("--verify-mode", choices=["eager", "graph"], default="graph")
+    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk"], default="graph")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--skip-greedy-compare", action="store_true")
     return parser.parse_args()
@@ -62,7 +62,8 @@ def main():
 
     print(
         "draft_len\tmatch\ttokens\ttok_s\tseconds\taccept_rate\t"
-        "target_fw_per_tok\tmtp_fw_per_tok\tverify_graph_replays\tverify_eager_calls\treject_reruns",
+        "target_fw_per_tok\tmtp_fw_per_tok\tverify_graph_replays\tverify_eager_calls\t"
+        "verify_chunk_calls\treject_reruns",
         flush=True,
     )
     for draft_len in parse_draft_lens(args.draft_lens):
@@ -79,6 +80,7 @@ def main():
             f"{summary['mtp_forwards_per_token']:.4f}\t"
             f"{summary['verify_graph_replays']}\t"
             f"{summary['verify_eager_calls']}\t"
+            f"{summary['verify_chunk_calls']}\t"
             f"{summary['reject_reruns']}",
             flush=True,
         )

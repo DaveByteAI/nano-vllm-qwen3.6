@@ -859,6 +859,89 @@ class ModelRunner:
             "verify_mode_used": "graph",
         }
 
+    def prepare_verify_chunk(self, seqs: list[Sequence], input_token_ids: list[int], start_pos: int):
+        assert len(seqs) == 1, "chunk verify currently supports batch size 1"
+        assert input_token_ids, "chunk verify needs at least one input token"
+        seq = seqs[0]
+        verify_len = len(input_token_ids)
+        assert input_token_ids[0] == seq.last_token
+        context_len = start_pos + verify_len
+        needed_blocks = (context_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks
+
+        input_ids = torch.tensor(input_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.arange(start_pos, start_pos + verify_len, dtype=torch.int64, device="cuda")
+        cu_seqlens_q = torch.tensor([0, verify_len], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor([0, context_len], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            self._kv_slots_for_positions(seq, start_pos, verify_len),
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        block_tables = torch.tensor(
+            [seq.block_table[:needed_blocks]],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        state_indices = (
+            torch.tensor([seq.state_slot_id], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if self.config.is_hybrid
+            else None
+        )
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            verify_len,
+            context_len,
+            slot_mapping,
+            None,
+            block_tables,
+            state_indices=state_indices,
+        )
+        return input_ids, positions, None, None, None
+
+    @torch.inference_mode()
+    def run_verify_chunk_probe(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+        top_k: int = 5,
+        save_logits_as: str | None = None,
+        compare_logits_to: str | None = None,
+    ):
+        input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_verify_chunk(
+            seqs,
+            input_token_ids,
+            start_pos,
+        )
+        assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+            "chunk verify is text-only"
+        hidden_states = self.model(input_ids, positions)
+        reset_context()
+        logits = self.model.compute_logits(hidden_states)
+        logits_float = logits.float()
+        token_ids = self.sample(logits, None, greedy=True)
+        topk = self.topk_tokens(logits, top_k)
+        max_logit_diff = self._compare_logits(logits_float, compare_logits_to)
+
+        if save_logits_as is not None:
+            self.logit_probe_refs[save_logits_as] = logits_float.detach().clone()
+
+        reset_context()
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "topk": topk,
+            "logits_shape": tuple(logits_float.shape),
+            "max_logit_diff": max_logit_diff,
+            "verify_len": len(input_token_ids),
+            "context_len": start_pos + len(input_token_ids),
+            "verify_mode_used": "chunk",
+        }
+
     @torch.inference_mode()
     def run_verify_batch_fast(
         self,
@@ -867,6 +950,8 @@ class ModelRunner:
         start_pos: int,
         verify_mode: str = "eager",
     ):
+        if verify_mode == "chunk":
+            return self.run_verify_chunk_fast(seqs, input_token_ids, start_pos)
         if verify_mode == "graph" and not self.enforce_eager and hasattr(self, "verify_graphs"):
             verify_len = len(input_token_ids)
             if verify_len in self.verify_graphs:
@@ -952,6 +1037,62 @@ class ModelRunner:
             "token_ids": token_ids,
             "verify_mode_used": "graph",
         }
+
+    @torch.inference_mode()
+    def run_verify_chunk_fast(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+    ):
+        input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_verify_chunk(
+            seqs,
+            input_token_ids,
+            start_pos,
+        )
+        assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+            "chunk verify is text-only"
+        hidden_states = self.model(input_ids, positions)
+        reset_context()
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = self.sample(logits, None, greedy=True)
+
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "verify_mode_used": "chunk",
+        }
+
+    @torch.inference_mode()
+    def run_verify_auto_probe(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+        top_k: int = 5,
+        save_logits_as: str | None = None,
+        compare_logits_to: str | None = None,
+        verify_mode: str = "eager",
+    ):
+        if verify_mode == "chunk":
+            return self.run_verify_chunk_probe(
+                seqs,
+                input_token_ids,
+                start_pos,
+                top_k,
+                save_logits_as,
+                compare_logits_to,
+            )
+        return self.run_verify_batch_probe(
+            seqs,
+            input_token_ids,
+            start_pos,
+            top_k,
+            save_logits_as,
+            compare_logits_to,
+            verify_mode,
+        )
 
     def _run_mtp_draft(
         self,

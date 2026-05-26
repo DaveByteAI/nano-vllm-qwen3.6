@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--max-batched-tokens", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--draft-len", type=int, default=2)
-    parser.add_argument("--verify-mode", choices=["eager", "graph"], default="graph")
+    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk"], default="graph")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--compare-greedy", action="store_true")
     parser.add_argument("--hide-text", action="store_true")
@@ -93,7 +93,7 @@ def run_greedy_decode(args, prompt):
 def run_mtp_fast_decode(args, prompt):
     from nanovllm import SamplingParams
 
-    llm = create_llm(args, enable_mtp=True, enforce_eager=args.verify_mode != "graph")
+    llm = create_llm(args, enable_mtp=True, enforce_eager=args.verify_mode == "eager")
     llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))
     seq = llm.scheduler.waiting[-1]
     stats = {
@@ -107,6 +107,7 @@ def run_mtp_fast_decode(args, prompt):
         "verify_batch_tokens": 0,
         "verify_graph_replays": 0,
         "verify_eager_calls": 0,
+        "verify_chunk_calls": 0,
         "accept_length_total": 0,
         "compared_tokens": 0,
         "reject_reruns": 0,
@@ -168,6 +169,8 @@ def run_mtp_fast_decode(args, prompt):
         stats["target_forwards"] += verify_len
         if verify["verify_mode_used"] == "graph":
             stats["verify_graph_replays"] += 1
+        elif verify["verify_mode_used"] == "chunk":
+            stats["verify_chunk_calls"] += 1
         else:
             stats["verify_eager_calls"] += 1
 
@@ -209,6 +212,8 @@ def run_mtp_fast_decode(args, prompt):
             stats["target_forwards"] += len(rerun_input_ids)
             if rerun["verify_mode_used"] == "graph":
                 stats["verify_graph_replays"] += 1
+            elif rerun["verify_mode_used"] == "chunk":
+                stats["verify_chunk_calls"] += 1
             else:
                 stats["verify_eager_calls"] += 1
             commit_tokens(llm, seq, draft_token_ids[:accept_len] + [rerun["token_ids"][-1]])
@@ -238,6 +243,7 @@ def summarize_stats(token_count, stats):
         "mtp_forwards_per_token": stats.get("mtp_forwards", 0) / token_count,
         "verify_graph_replays": stats.get("verify_graph_replays", 0),
         "verify_eager_calls": stats.get("verify_eager_calls", 0),
+        "verify_chunk_calls": stats.get("verify_chunk_calls", 0),
         "reject_reruns": stats.get("reject_reruns", 0),
     }
 

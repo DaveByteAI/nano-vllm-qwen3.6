@@ -218,6 +218,11 @@ class GatedDeltaNet(nn.Module):
             seq_len = end - start
 
             x = hidden_states[start:end].unsqueeze(0)          # [1, L, H]
+            if not warmup and context.block_tables is not None:
+                si = state_indices[i].item()
+                outputs.append(self._forward_prefill_recurrent(x, si).squeeze(0))
+                continue
+
             mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)    # [1, D, L]
             z = self.in_proj_z(x)                               # [1, L, Dv]
             b = self.in_proj_b(x)                               # [1, L, Hv]
@@ -257,6 +262,41 @@ class GatedDeltaNet(nn.Module):
             outputs.append(out.squeeze(0))
 
         return torch.cat(outputs, dim=0)
+
+    def _forward_prefill_recurrent(self, x, state_index: int):
+        outputs = []
+        for t in range(x.size(1)):
+            x_t = x[:, t:t + 1]
+            mixed_qkv = self.in_proj_qkv(x_t).transpose(1, 2)
+            z = self.in_proj_z(x_t)
+            b = self.in_proj_b(x_t)
+            a = self.in_proj_a(x_t)
+
+            conv_state = self.conv_states[state_index:state_index + 1]
+            mixed_qkv, new_conv_state = causal_conv1d_decode(mixed_qkv, self.conv1d.weight, conv_state)
+            self.conv_states[state_index] = new_conv_state[0]
+
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            q, k, v = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = q.reshape(1, 1, self.num_k_heads, self.head_k_dim)
+            k = k.reshape(1, 1, self.num_k_heads, self.head_k_dim)
+            v = v.reshape(1, 1, self.num_v_heads, self.head_v_dim)
+
+            beta = b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            if self.gqa_ratio > 1:
+                q = q.repeat_interleave(self.gqa_ratio, dim=2)
+                k = k.repeat_interleave(self.gqa_ratio, dim=2)
+
+            rec_state = self.recurrent_states[state_index:state_index + 1]
+            out = recurrent_gated_delta_rule(q, k, v, g, beta, rec_state)
+            self.recurrent_states[state_index] = rec_state[0]
+
+            z_flat = z.reshape(-1, self.head_v_dim)
+            out = self.norm(out.reshape(-1, self.head_v_dim), z_flat)
+            out = self.out_proj(out.reshape(1, 1, self.value_dim))
+            outputs.append(out)
+        return torch.cat(outputs, dim=1)
 
     def _forward_decode(self, hidden_states):
         context = get_context()

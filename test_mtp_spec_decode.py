@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--verbose-steps", type=int, default=16)
     parser.add_argument("--force-reject-step", type=int, default=0)
-    parser.add_argument("--verify-mode", choices=["eager", "graph"], default="eager")
+    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk"], default="eager")
     parser.add_argument("--debug-mismatch", action="store_true")
     parser.add_argument("--mismatch-window", type=int, default=8)
     parser.add_argument("--skip-greedy-compare", action="store_true")
@@ -123,7 +123,7 @@ def commit_tokens(llm, seq, token_ids):
 def run_speculative(args, tokenizer, prompt):
     from nanovllm import SamplingParams
 
-    llm = create_llm(args, enable_mtp=True, enforce_eager=args.verify_mode != "graph")
+    llm = create_llm(args, enable_mtp=True, enforce_eager=args.verify_mode == "eager")
     llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))
     seq = llm.scheduler.waiting[-1]
 
@@ -140,6 +140,7 @@ def run_speculative(args, tokenizer, prompt):
         "verify_batch_tokens": 0,
         "verify_graph_replays": 0,
         "verify_eager_calls": 0,
+        "verify_chunk_calls": 0,
         "max_verify_batch_size": 0,
         "accept_length_total": 0,
         "max_accept_length": 0,
@@ -236,7 +237,7 @@ def run_speculative(args, tokenizer, prompt):
 
         call_started = perf_counter()
         verify = llm.model_runner.call(
-            "run_verify_batch_probe",
+            "run_verify_auto_probe",
             [seq],
             verify_input_ids,
             start_pos,
@@ -250,6 +251,8 @@ def run_speculative(args, tokenizer, prompt):
         stats["verify_batch_tokens"] += verify_len
         if verify["verify_mode_used"] == "graph":
             stats["verify_graph_replays"] += 1
+        elif verify["verify_mode_used"] == "chunk":
+            stats["verify_chunk_calls"] += 1
         else:
             stats["verify_eager_calls"] += 1
         stats["draft_token_attempts"] += verify_len
@@ -297,7 +300,7 @@ def run_speculative(args, tokenizer, prompt):
             ensure_block_capacity(llm, seq, start_pos + len(rerun_input_ids))
             call_started = perf_counter()
             rerun = llm.model_runner.call(
-                "run_verify_batch_probe",
+                "run_verify_auto_probe",
                 [seq],
                 rerun_input_ids,
                 start_pos,
@@ -311,11 +314,17 @@ def run_speculative(args, tokenizer, prompt):
             stats["reject_rerun_input_tokens"] += len(rerun_input_ids)
             if rerun["verify_mode_used"] == "graph":
                 stats["verify_graph_replays"] += 1
+            elif rerun["verify_mode_used"] == "chunk":
+                stats["verify_chunk_calls"] += 1
             else:
                 stats["verify_eager_calls"] += 1
             stats["target_forwards"] += len(rerun_input_ids)
             stats["decode_forwards"] += len(rerun_input_ids)
-            assert rerun["token_ids"] == target_token_ids[:len(rerun_input_ids)]
+            assert rerun["token_ids"] == target_token_ids[:len(rerun_input_ids)], (
+                f"rerun token mismatch: target_prefix={target_token_ids[:len(rerun_input_ids)]} "
+                f"rerun={rerun['token_ids']} accept_len={accept_len} "
+                f"drafts={draft_token_ids} verify_mode={args.verify_mode}"
+            )
             committed_token_ids = commit_tokens(
                 llm,
                 seq,
@@ -429,6 +438,7 @@ def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
     print(f"verify_batch_tokens: {spec_stats['verify_batch_tokens']}", flush=True)
     print(f"verify_graph_replays: {spec_stats['verify_graph_replays']}", flush=True)
     print(f"verify_eager_calls: {spec_stats['verify_eager_calls']}", flush=True)
+    print(f"verify_chunk_calls: {spec_stats['verify_chunk_calls']}", flush=True)
     print(f"avg_verify_batch_size: {avg_verify_batch_size:.3f}", flush=True)
     print(f"max_verify_batch_size: {spec_stats['max_verify_batch_size']}", flush=True)
     print(f"draft_token_attempts: {spec_stats['draft_token_attempts']}", flush=True)
