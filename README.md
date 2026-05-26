@@ -163,10 +163,11 @@ python test_mtp_spec_decode.py \
   --devices 0,1,2,3 \
   --tp 4 \
   --draft-len 4 \
+  --verify-mode graph \
   --max-tokens 64
 ```
 
-This prototype groups draft verification into batch-level accept/reject accounting. The current target verify runner still replays decode steps internally; a fused single-forward verify path is a later optimization.
+This prototype groups draft verification into batch-level accept/reject accounting. `--verify-mode graph` captures verify-length buckets 1-4 as CUDA graphs, so each verify call replays the internal sequential decode steps through one graph. This reduces Python/launch overhead, but it is not a fused parallel GDN verify kernel.
 
 Decode-state rollback smoke test:
 

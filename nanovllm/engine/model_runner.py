@@ -103,6 +103,8 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if hasattr(self, "verify_graphs"):
+                del self.verify_graphs, self.verify_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -308,6 +310,15 @@ class ModelRunner:
         if self.config.is_hybrid:
             self.decode_cpu_state_indices = torch.empty(max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
             self.decode_gpu_state_indices = torch.empty(max_num_seqs, dtype=torch.int32, device="cuda")
+        self.verify_graph_lens = [1, 2, 3, 4]
+        max_verify_len = max(self.verify_graph_lens)
+        self.verify_cpu_input_ids = torch.empty(max_verify_len, dtype=torch.int64, device="cpu", pin_memory=True)
+        self.verify_cpu_positions = torch.empty(max_verify_len, dtype=torch.int64, device="cpu", pin_memory=True)
+        self.verify_cpu_slot_mapping = torch.empty(max_verify_len, dtype=torch.int32, device="cpu", pin_memory=True)
+        self.verify_cpu_context_lens = torch.empty(max_verify_len, dtype=torch.int32, device="cpu", pin_memory=True)
+        self.verify_cpu_block_tables = torch.empty(1, max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=True)
+        if self.config.is_hybrid:
+            self.verify_cpu_state_indices = torch.empty(1, dtype=torch.int32, device="cpu", pin_memory=True)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -720,7 +731,20 @@ class ModelRunner:
         top_k: int = 5,
         save_logits_as: str | None = None,
         compare_logits_to: str | None = None,
+        verify_mode: str = "eager",
     ):
+        if verify_mode == "graph" and not self.enforce_eager and hasattr(self, "verify_graphs"):
+            verify_len = len(input_token_ids)
+            if verify_len in self.verify_graphs:
+                return self._run_verify_graph_probe(
+                    seqs,
+                    input_token_ids,
+                    start_pos,
+                    top_k,
+                    save_logits_as,
+                    compare_logits_to,
+                )
+
         assert len(seqs) == 1, "batch verify currently supports batch size 1"
         assert input_token_ids, "batch verify needs at least one input token"
         seq = seqs[0]
@@ -768,6 +792,71 @@ class ModelRunner:
             "max_logit_diff": max_logit_diff,
             "verify_len": verify_len,
             "context_len": context_len,
+            "verify_mode_used": "eager",
+        }
+
+    def _run_verify_graph_probe(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+        top_k: int = 5,
+        save_logits_as: str | None = None,
+        compare_logits_to: str | None = None,
+    ):
+        assert len(seqs) == 1, "verify graph currently supports batch size 1"
+        seq = seqs[0]
+        verify_len = len(input_token_ids)
+        assert input_token_ids and input_token_ids[0] == seq.last_token
+        vars = self.verify_graph_vars[verify_len]
+
+        needed_blocks = (start_pos + verify_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks
+
+        block_tables_cpu = self.verify_cpu_block_tables[:, :needed_blocks]
+        block_tables_cpu.fill_(-1)
+        for i, token_id in enumerate(input_token_ids):
+            pos = start_pos + i
+            self.verify_cpu_input_ids[i] = token_id
+            self.verify_cpu_positions[i] = pos
+            self.verify_cpu_context_lens[i] = pos + 1
+            self.verify_cpu_slot_mapping[i] = (
+                seq.block_table[pos // self.block_size] * self.block_size
+                + pos % self.block_size
+            )
+        for i, block_id in enumerate(seq.block_table[:needed_blocks]):
+            block_tables_cpu[0, i] = block_id
+
+        vars["input_ids"].copy_(self.verify_cpu_input_ids[:verify_len], non_blocking=True)
+        vars["positions"].copy_(self.verify_cpu_positions[:verify_len], non_blocking=True)
+        vars["slot_mapping"].copy_(self.verify_cpu_slot_mapping[:verify_len], non_blocking=True)
+        vars["context_lens"].copy_(self.verify_cpu_context_lens[:verify_len], non_blocking=True)
+        vars["block_tables"].fill_(-1)
+        vars["block_tables"][:, :needed_blocks].copy_(block_tables_cpu, non_blocking=True)
+        if self.config.is_hybrid:
+            self.verify_cpu_state_indices[0] = seq.state_slot_id
+            vars["state_indices"].copy_(self.verify_cpu_state_indices, non_blocking=True)
+
+        self.verify_graphs[verify_len].replay()
+        logits = self.model.compute_logits(vars["outputs"][:verify_len])
+        logits_float = logits.float()
+        token_ids = self.sample(logits, None, greedy=True)
+        topk = self.topk_tokens(logits, top_k)
+        max_logit_diff = self._compare_logits(logits_float, compare_logits_to)
+
+        if save_logits_as is not None:
+            self.logit_probe_refs[save_logits_as] = logits_float.detach().clone()
+
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "topk": topk,
+            "logits_shape": tuple(logits_float.shape),
+            "max_logit_diff": max_logit_diff,
+            "verify_len": verify_len,
+            "context_len": start_pos + verify_len,
+            "verify_mode_used": "graph",
         }
 
     def _run_mtp_draft(
@@ -934,3 +1023,55 @@ class ModelRunner:
         )
         if state_indices is not None:
             self.graph_vars["state_indices"] = state_indices
+        if config.is_hybrid:
+            self.reset_gdn_state_slots(list(range(max_bs)))
+        if config.enable_mtp:
+            self.capture_verify_cudagraph()
+
+    @torch.inference_mode()
+    def capture_verify_cudagraph(self):
+        config = self.config
+        hf_config = config.hf_config
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        self.verify_graphs = {}
+        self.verify_graph_vars = {}
+
+        for verify_len in self.verify_graph_lens:
+            input_ids = torch.zeros(verify_len, dtype=torch.int64)
+            positions = torch.arange(verify_len, dtype=torch.int64)
+            slot_mapping = torch.arange(verify_len, dtype=torch.int32)
+            context_lens = torch.arange(1, verify_len + 1, dtype=torch.int32)
+            block_tables = torch.zeros(1, max_num_blocks, dtype=torch.int32)
+            state_indices = torch.zeros(1, dtype=torch.int32) if config.is_hybrid else None
+            outputs = torch.zeros(verify_len, hf_config.hidden_size)
+
+            def run_verify_steps():
+                for i in range(verify_len):
+                    set_context(
+                        False,
+                        slot_mapping=slot_mapping[i:i + 1],
+                        context_lens=context_lens[i:i + 1],
+                        block_tables=block_tables,
+                        state_indices=state_indices,
+                    )
+                    outputs[i:i + 1] = self.model(input_ids[i:i + 1], positions[i:i + 1])
+
+            run_verify_steps()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                run_verify_steps()
+            self.verify_graphs[verify_len] = graph
+            self.verify_graph_vars[verify_len] = dict(
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                outputs=outputs,
+            )
+            if state_indices is not None:
+                self.verify_graph_vars[verify_len]["state_indices"] = state_indices
+            torch.cuda.synchronize()
+            reset_context()
+            if config.is_hybrid:
+                self.reset_gdn_state_slots([0])

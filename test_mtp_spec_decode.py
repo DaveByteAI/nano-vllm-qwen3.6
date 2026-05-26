@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--verbose-steps", type=int, default=16)
     parser.add_argument("--force-reject-step", type=int, default=0)
+    parser.add_argument("--verify-mode", choices=["eager", "graph"], default="eager")
     parser.add_argument("--skip-greedy-compare", action="store_true")
     return parser.parse_args()
 
@@ -39,14 +40,14 @@ def decode_text(tokenizer, token_ids):
     return tokenizer.decode(token_ids).replace("<|im_end|>", "")
 
 
-def create_llm(args, enable_mtp):
+def create_llm(args, enable_mtp, enforce_eager=True):
     from nanovllm import LLM
 
     return LLM(
         os.path.expanduser(args.model),
         enable_vision=False,
         enable_mtp=enable_mtp,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         tensor_parallel_size=args.tp,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_batched_tokens,
@@ -70,7 +71,7 @@ def close_llm(llm):
 def run_greedy(args, prompt):
     from nanovllm import SamplingParams
 
-    llm = create_llm(args, enable_mtp=False)
+    llm = create_llm(args, enable_mtp=False, enforce_eager=True)
     llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))
     seq = llm.scheduler.waiting[-1]
     stats = {
@@ -119,7 +120,7 @@ def commit_tokens(llm, seq, token_ids):
 def run_speculative(args, tokenizer, prompt):
     from nanovllm import SamplingParams
 
-    llm = create_llm(args, enable_mtp=True)
+    llm = create_llm(args, enable_mtp=True, enforce_eager=args.verify_mode != "graph")
     llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))
     seq = llm.scheduler.waiting[-1]
 
@@ -134,6 +135,8 @@ def run_speculative(args, tokenizer, prompt):
         "mtp_forwards": 0,
         "verify_batches": 0,
         "verify_batch_tokens": 0,
+        "verify_graph_replays": 0,
+        "verify_eager_calls": 0,
         "max_verify_batch_size": 0,
         "accept_length_total": 0,
         "max_accept_length": 0,
@@ -212,10 +215,15 @@ def run_speculative(args, tokenizer, prompt):
             args.top_k,
             snapshot_name,
             None,
+            args.verify_mode,
         )
         stats["verify_call_seconds"] += perf_counter() - call_started
         stats["verify_batches"] += 1
         stats["verify_batch_tokens"] += verify_len
+        if verify["verify_mode_used"] == "graph":
+            stats["verify_graph_replays"] += 1
+        else:
+            stats["verify_eager_calls"] += 1
         stats["draft_token_attempts"] += verify_len
         stats["target_forwards"] += verify_len
         stats["decode_forwards"] += verify_len
@@ -263,10 +271,15 @@ def run_speculative(args, tokenizer, prompt):
                 args.top_k,
                 None,
                 snapshot_name,
+                args.verify_mode,
             )
             stats["rerun_call_seconds"] += perf_counter() - call_started
             stats["reject_reruns"] += 1
             stats["reject_rerun_input_tokens"] += len(rerun_input_ids)
+            if rerun["verify_mode_used"] == "graph":
+                stats["verify_graph_replays"] += 1
+            else:
+                stats["verify_eager_calls"] += 1
             stats["target_forwards"] += len(rerun_input_ids)
             stats["decode_forwards"] += len(rerun_input_ids)
             assert rerun["token_ids"] == target_token_ids[:len(rerun_input_ids)]
@@ -282,7 +295,8 @@ def run_speculative(args, tokenizer, prompt):
 
         if generated_tokens <= args.verbose_steps:
             print(
-                f"verify batch: size={verify_len} accept_len={accept_len} "
+                f"verify batch: mode={verify['verify_mode_used']} size={verify_len} "
+                f"accept_len={accept_len} "
                 f"targets={target_token_ids} {tokenizer.decode(target_token_ids)!r} "
                 f"rejected_target={rejected_target_ids} forced_reject={forced_reject}",
                 flush=True,
@@ -327,9 +341,12 @@ def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
 
     print("\n=== SPEC STATS ===", flush=True)
     print(f"draft_len: {spec_stats['draft_len']}", flush=True)
+    print(f"verify_mode_requested: {spec_stats['verify_mode_requested']}", flush=True)
     print(f"draft_rounds: {spec_stats['draft_rounds']}", flush=True)
     print(f"verify_batches: {spec_stats['verify_batches']}", flush=True)
     print(f"verify_batch_tokens: {spec_stats['verify_batch_tokens']}", flush=True)
+    print(f"verify_graph_replays: {spec_stats['verify_graph_replays']}", flush=True)
+    print(f"verify_eager_calls: {spec_stats['verify_eager_calls']}", flush=True)
     print(f"avg_verify_batch_size: {avg_verify_batch_size:.3f}", flush=True)
     print(f"max_verify_batch_size: {spec_stats['max_verify_batch_size']}", flush=True)
     print(f"draft_token_attempts: {spec_stats['draft_token_attempts']}", flush=True)
@@ -385,6 +402,7 @@ def main():
     print("\n=== RUN MTP SPEC DECODE ===", flush=True)
     spec_ids, spec_stats = run_speculative(args, tokenizer, prompt)
     spec_stats["draft_len"] = args.draft_len
+    spec_stats["verify_mode_requested"] = args.verify_mode
     spec_stats["model_call_seconds"] = (
         spec_stats["main_call_seconds"]
         + spec_stats["verify_call_seconds"]
