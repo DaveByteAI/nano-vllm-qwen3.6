@@ -47,6 +47,7 @@ run_text_qwen36_fp8.py
 test_mtp_forward.py
 test_mtp1_verify.py
 test_mtp1_spec_decode.py
+test_mtp_spec_decode.py
 test_state_rollback.py
 bench_qwen35_fixed.py
 ```
@@ -154,6 +155,17 @@ python test_mtp1_spec_decode.py \
 
 Use `--force-reject-attempt 1` to force one reject path and verify state rollback.
 
+Qwen3.6 multi-token MTP speculative decode prototype with greedy alignment and overhead stats:
+
+```bash
+python test_mtp_spec_decode.py \
+  --model ~/huggingface/Qwen3.6-27B-FP8 \
+  --devices 0,1,2,3 \
+  --tp 4 \
+  --draft-len 4 \
+  --max-tokens 64
+```
+
 Decode-state rollback smoke test:
 
 ```bash
@@ -204,7 +216,7 @@ These are simple single-request smoke tests, not full serving benchmarks.
 Syntax check without model weights:
 
 ```bash
-python -m compileall nanovllm examples run_text_qwen35_v2.py run_text_qwen36_fp8.py test_mtp_forward.py test_mtp1_verify.py test_mtp1_spec_decode.py test_state_rollback.py
+python -m compileall nanovllm examples run_text_qwen35_v2.py run_text_qwen36_fp8.py test_mtp_forward.py test_mtp1_verify.py test_mtp1_spec_decode.py test_mtp_spec_decode.py test_state_rollback.py
 ```
 
 Useful runtime checks:

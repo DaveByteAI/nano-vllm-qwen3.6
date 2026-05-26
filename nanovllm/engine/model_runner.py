@@ -701,9 +701,11 @@ class ModelRunner:
         seqs: list[Sequence],
         is_prefill: bool,
         top_k: int = 5,
+        draft_len: int = 1,
     ):
         assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
         assert len(seqs) == 1, "MTP probe currently supports batch size 1"
+        assert draft_len >= 0
 
         if is_prefill:
             input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
@@ -737,33 +739,53 @@ class ModelRunner:
         if self.world_size > 1:
             dist.broadcast(main_token_tensor, src=0)
 
-        inputs_embeds = self.model.model.embed_tokens(main_token_tensor)
-        cu_seqlens = torch.arange(
-            main_hidden.size(0) + 1,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        slot_mapping = torch.full(
-            (main_hidden.size(0),),
-            -1,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        set_context(
-            True,
-            cu_seqlens,
-            cu_seqlens,
-            1,
-            1,
-            slot_mapping,
-            None,
-            None,
-            state_indices=None,
-        )
-        mtp_hidden = self.model.mtp(mtp_positions, main_hidden, inputs_embeds)
-        draft_logits = self.model.compute_logits(mtp_hidden)
-        draft_token_ids = self.sample(draft_logits, None, greedy=True)
-        draft_topk = self.topk_tokens(draft_logits, top_k)
+        current_hidden = main_hidden
+        current_positions = mtp_positions
+        current_token_tensor = main_token_tensor
+        draft_token_ids = []
+        draft_topk = []
+        mtp_hidden_shape = None
+        draft_logits_shape = None
+        for _ in range(draft_len):
+            inputs_embeds = self.model.model.embed_tokens(current_token_tensor)
+            cu_seqlens = torch.arange(
+                current_hidden.size(0) + 1,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            slot_mapping = torch.full(
+                (current_hidden.size(0),),
+                -1,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            set_context(
+                True,
+                cu_seqlens,
+                cu_seqlens,
+                1,
+                1,
+                slot_mapping,
+                None,
+                None,
+                state_indices=None,
+            )
+            mtp_hidden = self.model.mtp(current_positions, current_hidden, inputs_embeds)
+            draft_logits = self.model.compute_logits(mtp_hidden)
+            next_token_ids = self.sample(draft_logits, None, greedy=True)
+            next_topk = self.topk_tokens(draft_logits, top_k)
+            next_token_tensor = torch.empty(current_hidden.size(0), dtype=torch.int64, device="cuda")
+            if self.rank == 0:
+                draft_token_ids.append(next_token_ids[0])
+                draft_topk.append(next_topk[0])
+                next_token_tensor.copy_(torch.tensor(next_token_ids, dtype=torch.int64, device="cuda"))
+            if self.world_size > 1:
+                dist.broadcast(next_token_tensor, src=0)
+            current_hidden = mtp_hidden
+            current_positions = current_positions + 1
+            current_token_tensor = next_token_tensor
+            mtp_hidden_shape = tuple(mtp_hidden.shape)
+            draft_logits_shape = tuple(draft_logits.shape)
         reset_context()
 
         if self.rank != 0:
@@ -773,8 +795,10 @@ class ModelRunner:
             "draft_token_ids": draft_token_ids,
             "draft_topk": draft_topk,
             "main_hidden_shape": tuple(main_hidden.shape),
-            "mtp_hidden_shape": tuple(mtp_hidden.shape),
-            "draft_logits_shape": tuple(draft_logits.shape),
+            "mtp_hidden_shape": mtp_hidden_shape,
+            "draft_logits_shape": draft_logits_shape,
+            "draft_len": draft_len,
+            "mtp_forwards": draft_len,
             "mtp_loaded_count": len([name for name in self.load_result.loaded_names if name.startswith("mtp.")]),
             "mtp_skipped_count": len([name for name in self.load_result.skipped_names if name.startswith("mtp.")]),
         }
@@ -784,8 +808,8 @@ class ModelRunner:
         return self._run_mtp_draft(seqs, is_prefill=True, top_k=top_k)
 
     @torch.inference_mode()
-    def run_mtp_draft_step(self, seqs: list[Sequence], is_prefill: bool, top_k: int = 5):
-        return self._run_mtp_draft(seqs, is_prefill=is_prefill, top_k=top_k)
+    def run_mtp_draft_step(self, seqs: list[Sequence], is_prefill: bool, top_k: int = 5, draft_len: int = 1):
+        return self._run_mtp_draft(seqs, is_prefill=is_prefill, top_k=top_k, draft_len=draft_len)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

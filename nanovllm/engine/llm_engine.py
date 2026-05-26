@@ -23,6 +23,7 @@ class LLMEngine:
         self.image_token_id = config.image_token_id
         self.vision_start_token_id = config.vision_start_token_id
         self.vision_end_token_id = config.vision_end_token_id
+        self._exited = False
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -39,10 +40,15 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        if self._exited:
+            return
+        self._exited = True
+        if hasattr(self, "model_runner"):
+            self.model_runner.call("exit")
+            del self.model_runner
         for p in self.ps:
             p.join()
+        self.ps.clear()
 
     def add_request(self, prompt: str | list[int] | list[dict], sampling_params: SamplingParams):
         if isinstance(prompt, list) and len(prompt) > 0 and isinstance(prompt[0], dict):
