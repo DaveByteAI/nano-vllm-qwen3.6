@@ -71,7 +71,7 @@ def close_llm(llm):
 def run_greedy(args, prompt):
     from nanovllm import SamplingParams
 
-    llm = create_llm(args, enable_mtp=False, enforce_eager=True)
+    llm = create_llm(args, enable_mtp=False, enforce_eager=False)
     llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))
     seq = llm.scheduler.waiting[-1]
     stats = {
