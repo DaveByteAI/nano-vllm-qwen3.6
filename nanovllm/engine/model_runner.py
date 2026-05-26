@@ -542,6 +542,74 @@ class ModelRunner:
         return token_ids
 
     @torch.inference_mode()
+    def run_mtp_probe(self, seqs: list[Sequence]):
+        assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
+        assert len(seqs) == 1, "MTP probe currently supports batch size 1"
+
+        input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
+        assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+            "MTP probe is text-only"
+        assert positions.ndim == 1, "MTP probe expects 1D text positions"
+
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            pixel_values=None,
+            image_grid_thw=None,
+            image_token_mask=None,
+        )
+        context = get_context()
+        last_indices = context.cu_seqlens_q[1:] - 1
+        main_hidden = hidden_states[last_indices].contiguous()
+        logits = self.model.compute_logits(hidden_states)
+        main_token_ids = self.sample(logits, None, greedy=True)
+
+        main_token_tensor = torch.empty(main_hidden.size(0), dtype=torch.int64, device="cuda")
+        if self.rank == 0:
+            main_token_tensor.copy_(torch.tensor(main_token_ids, dtype=torch.int64, device="cuda"))
+        if self.world_size > 1:
+            dist.broadcast(main_token_tensor, src=0)
+
+        inputs_embeds = self.model.model.embed_tokens(main_token_tensor)
+        mtp_positions = positions[last_indices].contiguous() + 1
+        cu_seqlens = torch.arange(
+            main_hidden.size(0) + 1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        slot_mapping = torch.full(
+            (main_hidden.size(0),),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        set_context(
+            True,
+            cu_seqlens,
+            cu_seqlens,
+            1,
+            1,
+            slot_mapping,
+            None,
+            None,
+            state_indices=None,
+        )
+        mtp_hidden = self.model.mtp(mtp_positions, main_hidden, inputs_embeds)
+        draft_logits = self.model.compute_logits(mtp_hidden)
+        draft_token_ids = self.sample(draft_logits, None, greedy=True)
+        reset_context()
+
+        if self.rank != 0:
+            return None
+        return {
+            "main_token_ids": main_token_ids,
+            "draft_token_ids": draft_token_ids,
+            "main_hidden_shape": tuple(main_hidden.shape),
+            "mtp_hidden_shape": tuple(mtp_hidden.shape),
+            "draft_logits_shape": tuple(draft_logits.shape),
+        }
+
+    @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config

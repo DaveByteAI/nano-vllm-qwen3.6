@@ -20,6 +20,7 @@ class Config:
     is_hybrid: bool = False
     max_state_slots: int = 0
     enable_vision: bool = True
+    enable_mtp: bool = False
     # Vision / multimodal
     vision_config: object | None = None
     image_token_id: int = -1
@@ -52,4 +53,5 @@ class Config:
             self.hf_config.dtype = torch.bfloat16
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         self.hf_config.max_model_len = self.max_model_len
+        self.hf_config.enable_mtp = self.enable_mtp
         self.is_hybrid = hasattr(self.hf_config, 'layer_types')

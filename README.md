@@ -17,6 +17,7 @@ and quantized checkpoint loading are all implemented in a small codebase.
 - CUDA Graph decode when `enforce_eager=False`.
 - Rank-local FP8 checkpoint loading: each TP rank slices its shard and dequantizes only
   the shard it owns.
+- Experimental Qwen3.6 MTP weight loading and single-step forward probe.
 
 ## Current Limitations
 
@@ -27,6 +28,8 @@ and quantized checkpoint loading are all implemented in a small codebase.
   does not fit in 24GB cards with the current BF16-resident implementation.
 - Loading Qwen3.6-27B-FP8 is slow because the original FP8 checkpoint is converted at
   startup. A pre-converted TP-sharded checkpoint would start faster.
+- MTP is currently a prototype for weight loading and one-step draft-token probing. It
+  is not wired into speculative decoding yet.
 - This is not a production serving stack. It is a research/learning implementation.
 
 ## Repository Layout
@@ -40,6 +43,7 @@ nanovllm/
 examples/          original examples
 run_text_qwen35_v2.py
 run_text_qwen36_fp8.py
+test_mtp_forward.py
 bench_qwen35_fixed.py
 ```
 
@@ -114,6 +118,15 @@ python run_text_qwen36_fp8.py \
   --prompt "你好，请用三句话介绍你自己。然后讲一个简短笑话。"
 ```
 
+Qwen3.6 MTP single-step forward probe:
+
+```bash
+python test_mtp_forward.py \
+  --model ~/huggingface/Qwen3.6-27B-FP8 \
+  --devices 0,1,2,3 \
+  --tp 4
+```
+
 ## API Example
 
 ```python
@@ -155,7 +168,7 @@ These are simple single-request smoke tests, not full serving benchmarks.
 Syntax check without model weights:
 
 ```bash
-python -m compileall nanovllm examples run_text_qwen35_v2.py run_text_qwen36_fp8.py
+python -m compileall nanovllm examples run_text_qwen35_v2.py run_text_qwen36_fp8.py test_mtp_forward.py
 ```
 
 Useful runtime checks:

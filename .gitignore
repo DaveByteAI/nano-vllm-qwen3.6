@@ -206,10 +206,10 @@ cython_debug/
 *.pth
 *.gguf
 *.onnx
-models/
-checkpoints/
-huggingface/
-outputs/
-logs/
+/models/
+/checkpoints/
+/huggingface/
+/outputs/
+/logs/
 image_demo.jpg
 uv.lock

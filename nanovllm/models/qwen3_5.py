@@ -185,6 +185,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         if getattr(config, 'tie_word_embeddings', False):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
+        self.mtp = None
+        if getattr(config, "enable_mtp", False):
+            from nanovllm.models.qwen3_mtp import Qwen3MTP
+            self.mtp = Qwen3MTP(config)
+
         # Vision encoder (optional)
         self.visual = None
         if vision_config is not None:
