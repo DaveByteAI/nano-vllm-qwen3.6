@@ -44,6 +44,8 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.decode_state_snapshots = {}
+        self.logit_probe_refs = {}
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -210,6 +212,70 @@ class ModelRunner:
             if isinstance(layer, GatedDeltaNet):
                 layer.conv_states.index_fill_(0, indices, 0)
                 layer.recurrent_states.index_fill_(0, indices, 0)
+
+    def _decode_kv_slots(self, seqs: list[Sequence]) -> list[int]:
+        return [
+            seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            for seq in seqs
+        ]
+
+    def save_decode_state(self, name: str, seqs: list[Sequence]):
+        kv_slots = self._decode_kv_slots(seqs)
+        state_slot_ids = [seq.state_slot_id for seq in seqs if seq.state_slot_id != -1]
+        snapshot = {
+            "kv_slots": kv_slots,
+            "state_slot_ids": state_slot_ids,
+            "kv_cache": None,
+            "gdn_states": [],
+        }
+
+        if kv_slots:
+            kv_indices = torch.tensor(kv_slots, dtype=torch.long, device="cuda")
+            flat_kv = self.kv_cache.flatten(2, 3)
+            snapshot["kv_cache"] = flat_kv.index_select(2, kv_indices).clone()
+
+        if self.config.is_hybrid and state_slot_ids:
+            from nanovllm.layers.gated_delta_net import GatedDeltaNet
+            state_indices = torch.tensor(state_slot_ids, dtype=torch.long, device="cuda")
+            for layer in self.model.modules():
+                if isinstance(layer, GatedDeltaNet):
+                    snapshot["gdn_states"].append((
+                        layer.conv_states.index_select(0, state_indices).clone(),
+                        layer.recurrent_states.index_select(0, state_indices).clone(),
+                    ))
+
+        self.decode_state_snapshots[name] = snapshot
+        if self.rank != 0:
+            return None
+        return {
+            "kv_slots": kv_slots,
+            "state_slot_ids": state_slot_ids,
+            "gdn_layers": len(snapshot["gdn_states"]),
+        }
+
+    def restore_decode_state(self, name: str):
+        snapshot = self.decode_state_snapshots[name]
+        kv_slots = snapshot["kv_slots"]
+        state_slot_ids = snapshot["state_slot_ids"]
+
+        if kv_slots and snapshot["kv_cache"] is not None:
+            kv_indices = torch.tensor(kv_slots, dtype=torch.long, device="cuda")
+            flat_kv = self.kv_cache.flatten(2, 3)
+            flat_kv.index_copy_(2, kv_indices, snapshot["kv_cache"])
+
+        if self.config.is_hybrid and state_slot_ids:
+            from nanovllm.layers.gated_delta_net import GatedDeltaNet
+            state_indices = torch.tensor(state_slot_ids, dtype=torch.long, device="cuda")
+            gdn_iter = iter(snapshot["gdn_states"])
+            for layer in self.model.modules():
+                if isinstance(layer, GatedDeltaNet):
+                    conv_state, recurrent_state = next(gdn_iter)
+                    layer.conv_states.index_copy_(0, state_indices, conv_state)
+                    layer.recurrent_states.index_copy_(0, state_indices, recurrent_state)
+
+    def drop_decode_state(self, name: str):
+        self.decode_state_snapshots.pop(name, None)
+        self.logit_probe_refs.pop(name, None)
 
     def allocate_runtime_buffers(self):
         """Preallocate small staging tensors used on every decode step."""
@@ -578,6 +644,57 @@ class ModelRunner:
         token_ids = self.sample(logits, temperatures, greedy)
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def run_step_probe(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        top_k: int = 5,
+        save_logits_as: str | None = None,
+        compare_logits_to: str | None = None,
+    ):
+        assert len(seqs) == 1, "step probe currently supports batch size 1"
+        if is_prefill:
+            input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
+            assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+                "step probe is text-only"
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+            pixel_values = image_grid_thw = image_token_mask = None
+
+        logits = self.run_model(
+            input_ids,
+            positions,
+            is_prefill,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            image_token_mask=image_token_mask,
+        )
+        logits_float = logits.float()
+        token_ids = self.sample(logits, None, greedy=True)
+        topk = self.topk_tokens(logits, top_k)
+        max_logit_diff = None
+
+        if compare_logits_to is not None:
+            ref = self.logit_probe_refs[compare_logits_to]
+            local_diff = (logits_float - ref).abs().max()
+            if self.world_size > 1:
+                dist.all_reduce(local_diff, op=dist.ReduceOp.MAX)
+            max_logit_diff = float(local_diff.item())
+
+        if save_logits_as is not None:
+            self.logit_probe_refs[save_logits_as] = logits_float.detach().clone()
+
+        reset_context()
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "topk": topk,
+            "logits_shape": tuple(logits.shape),
+            "max_logit_diff": max_logit_diff,
+        }
 
     def _run_mtp_draft(
         self,
