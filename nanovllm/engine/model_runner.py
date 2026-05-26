@@ -2,6 +2,7 @@ import pickle
 import torch
 import torch.distributed as dist
 import torch._dynamo
+from copy import copy
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -213,14 +214,25 @@ class ModelRunner:
                 layer.conv_states.index_fill_(0, indices, 0)
                 layer.recurrent_states.index_fill_(0, indices, 0)
 
-    def _decode_kv_slots(self, seqs: list[Sequence]) -> list[int]:
+    def _kv_slots_for_positions(self, seq: Sequence, start_pos: int, num_slots: int) -> list[int]:
         return [
-            seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-            for seq in seqs
+            seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size
+            for pos in range(start_pos, start_pos + num_slots)
         ]
+
+    def _decode_kv_slots(self, seqs: list[Sequence]) -> list[int]:
+        return [self._kv_slots_for_positions(seq, len(seq) - 1, 1)[0] for seq in seqs]
 
     def save_decode_state(self, name: str, seqs: list[Sequence]):
         kv_slots = self._decode_kv_slots(seqs)
+        return self._save_decode_state_slots(name, seqs, kv_slots)
+
+    def save_decode_state_range(self, name: str, seqs: list[Sequence], start_pos: int, num_slots: int):
+        assert len(seqs) == 1, "decode state range currently supports batch size 1"
+        kv_slots = self._kv_slots_for_positions(seqs[0], start_pos, num_slots)
+        return self._save_decode_state_slots(name, seqs, kv_slots)
+
+    def _save_decode_state_slots(self, name: str, seqs: list[Sequence], kv_slots: list[int]):
         state_slot_ids = [seq.state_slot_id for seq in seqs if seq.state_slot_id != -1]
         snapshot = {
             "kv_slots": kv_slots,
@@ -536,6 +548,16 @@ class ModelRunner:
             for row_ids, row_values in zip(token_ids.tolist(), values.tolist())
         ]
 
+    def _compare_logits(self, logits: torch.Tensor, compare_logits_to: str | None):
+        if compare_logits_to is None:
+            return None
+        ref = self.logit_probe_refs[compare_logits_to]
+        ref = ref[:logits.size(0)]
+        local_diff = (logits.float() - ref).abs().max()
+        if self.world_size > 1:
+            dist.all_reduce(local_diff, op=dist.ReduceOp.MAX)
+        return float(local_diff.item())
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool,
                   pixel_values=None, image_grid_thw=None, image_token_mask=None):
@@ -674,14 +696,7 @@ class ModelRunner:
         logits_float = logits.float()
         token_ids = self.sample(logits, None, greedy=True)
         topk = self.topk_tokens(logits, top_k)
-        max_logit_diff = None
-
-        if compare_logits_to is not None:
-            ref = self.logit_probe_refs[compare_logits_to]
-            local_diff = (logits_float - ref).abs().max()
-            if self.world_size > 1:
-                dist.all_reduce(local_diff, op=dist.ReduceOp.MAX)
-            max_logit_diff = float(local_diff.item())
+        max_logit_diff = self._compare_logits(logits_float, compare_logits_to)
 
         if save_logits_as is not None:
             self.logit_probe_refs[save_logits_as] = logits_float.detach().clone()
@@ -694,6 +709,65 @@ class ModelRunner:
             "topk": topk,
             "logits_shape": tuple(logits.shape),
             "max_logit_diff": max_logit_diff,
+        }
+
+    @torch.inference_mode()
+    def run_verify_batch_probe(
+        self,
+        seqs: list[Sequence],
+        input_token_ids: list[int],
+        start_pos: int,
+        top_k: int = 5,
+        save_logits_as: str | None = None,
+        compare_logits_to: str | None = None,
+    ):
+        assert len(seqs) == 1, "batch verify currently supports batch size 1"
+        assert input_token_ids, "batch verify needs at least one input token"
+        seq = seqs[0]
+        verify_len = len(input_token_ids)
+        assert input_token_ids[0] == seq.last_token
+        context_len = start_pos + verify_len
+        needed_blocks = (context_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks
+
+        # Keep the batch verify boundary in one runner call, while replaying decode
+        # steps internally. A true fused verify path needs separate GDN handling.
+        work_seq = copy(seq)
+        work_seq.token_ids = list(seq.token_ids)
+        work_seq.block_table = list(seq.block_table)
+        token_ids = []
+        topk = []
+        logits_parts = []
+        for i, next_input_token_id in enumerate(input_token_ids):
+            assert work_seq.last_token == next_input_token_id
+            input_ids, positions = self.prepare_decode([work_seq])
+            logits = self.run_model(input_ids, positions, False)
+            logits_parts.append(logits.float())
+            sampled_token_ids = self.sample(logits, None, greedy=True)
+            sampled_topk = self.topk_tokens(logits, top_k)
+            if self.rank == 0:
+                token_ids.extend(sampled_token_ids)
+                topk.extend(sampled_topk)
+            reset_context()
+            if i != verify_len - 1:
+                work_seq.append_token(input_token_ids[i + 1])
+                work_seq.num_cached_tokens += 1
+
+        logits_float = torch.cat(logits_parts, dim=0)
+        max_logit_diff = self._compare_logits(logits_float, compare_logits_to)
+
+        if save_logits_as is not None:
+            self.logit_probe_refs[save_logits_as] = logits_float.detach().clone()
+
+        if self.rank != 0:
+            return None
+        return {
+            "token_ids": token_ids,
+            "topk": topk,
+            "logits_shape": tuple(logits_float.shape),
+            "max_logit_diff": max_logit_diff,
+            "verify_len": verify_len,
+            "context_len": context_len,
         }
 
     def _run_mtp_draft(

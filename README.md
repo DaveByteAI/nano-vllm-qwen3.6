@@ -155,7 +155,7 @@ python test_mtp1_spec_decode.py \
 
 Use `--force-reject-attempt 1` to force one reject path and verify state rollback.
 
-Qwen3.6 multi-token MTP speculative decode prototype with greedy alignment and overhead stats:
+Qwen3.6 multi-token MTP speculative decode prototype with batch verify, greedy alignment, and overhead stats:
 
 ```bash
 python test_mtp_spec_decode.py \
@@ -165,6 +165,8 @@ python test_mtp_spec_decode.py \
   --draft-len 4 \
   --max-tokens 64
 ```
+
+This prototype groups draft verification into batch-level accept/reject accounting. The current target verify runner still replays decode steps internally; a fused single-forward verify path is a later optimization.
 
 Decode-state rollback smoke test:
 

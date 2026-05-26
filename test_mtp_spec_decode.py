@@ -3,6 +3,8 @@ import gc
 import os
 from time import perf_counter
 
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 from test_state_rollback import restore_scheduler, snapshot_scheduler
 
 
@@ -93,6 +95,27 @@ def run_greedy(args, prompt):
     return token_ids, stats
 
 
+def ensure_block_capacity(llm, seq, context_len):
+    block_manager = llm.scheduler.block_manager
+    needed_blocks = (context_len + seq.block_size - 1) // seq.block_size
+    while len(seq.block_table) < needed_blocks:
+        if not block_manager.free_block_ids:
+            raise RuntimeError("no free KV cache block for batch verify")
+        block_id = block_manager.free_block_ids[0]
+        block_manager._allocate_block(block_id)
+        seq.block_table.append(block_id)
+
+
+def commit_tokens(llm, seq, token_ids):
+    committed = []
+    for token_id in token_ids:
+        if llm.is_finished():
+            break
+        llm.scheduler.postprocess([seq], [token_id], False)
+        committed.append(token_id)
+    return committed
+
+
 def run_speculative(args, tokenizer, prompt):
     from nanovllm import SamplingParams
 
@@ -109,7 +132,16 @@ def run_speculative(args, tokenizer, prompt):
         "prefill_forwards": 0,
         "decode_forwards": 0,
         "mtp_forwards": 0,
+        "verify_batches": 0,
+        "verify_batch_tokens": 0,
+        "max_verify_batch_size": 0,
+        "accept_length_total": 0,
+        "max_accept_length": 0,
+        "compared_tokens": 0,
+        "discarded_draft_tokens": 0,
+        "wasted_verified_tokens_after_reject": 0,
         "reject_reruns": 0,
+        "reject_rerun_input_tokens": 0,
         "main_call_seconds": 0.0,
         "verify_call_seconds": 0.0,
         "rerun_call_seconds": 0.0,
@@ -158,79 +190,110 @@ def run_speculative(args, tokenizer, prompt):
         if llm.is_finished():
             break
 
-        for draft_token_id in draft_token_ids:
-            if llm.is_finished():
-                break
+        remaining_after_main = args.max_tokens - seq.num_completion_tokens
+        draft_token_ids = draft_token_ids[:remaining_after_main]
+        if not draft_token_ids:
+            continue
 
-            verify_seqs, verify_is_prefill = llm.scheduler.schedule()
-            assert not verify_is_prefill
+        verify_len = len(draft_token_ids)
+        start_pos = len(seq) - 1
+        verify_input_ids = [seq.last_token] + draft_token_ids[:-1]
+        snapshot_name = f"spec_batch_{stats['verify_batches'] + 1}"
+        scheduler_snapshot = snapshot_scheduler(llm, seq)
+        ensure_block_capacity(llm, seq, start_pos + verify_len)
+        llm.model_runner.call("save_decode_state_range", snapshot_name, [seq], start_pos, verify_len)
 
+        call_started = perf_counter()
+        verify = llm.model_runner.call(
+            "run_verify_batch_probe",
+            [seq],
+            verify_input_ids,
+            start_pos,
+            args.top_k,
+            snapshot_name,
+            None,
+        )
+        stats["verify_call_seconds"] += perf_counter() - call_started
+        stats["verify_batches"] += 1
+        stats["verify_batch_tokens"] += verify_len
+        stats["draft_token_attempts"] += verify_len
+        stats["target_forwards"] += verify_len
+        stats["decode_forwards"] += verify_len
+        stats["max_verify_batch_size"] = max(stats["max_verify_batch_size"], verify_len)
+
+        target_token_ids = verify["token_ids"]
+        accept_len = 0
+        reject_index = None
+        forced_reject = False
+        for i, (draft_token_id, target_token_id) in enumerate(zip(draft_token_ids, target_token_ids)):
             verify_step += 1
-            stats["draft_token_attempts"] += 1
-            snapshot_name = f"spec_{verify_step}"
-            scheduler_snapshot = snapshot_scheduler(llm, seq)
-            llm.model_runner.call("save_decode_state", snapshot_name, verify_seqs)
-
-            call_started = perf_counter()
-            verify = llm.model_runner.call(
-                "run_step_probe",
-                verify_seqs,
-                False,
-                args.top_k,
-                snapshot_name,
-                None,
-            )
-            stats["verify_call_seconds"] += perf_counter() - call_started
-            stats["target_forwards"] += 1
-            stats["decode_forwards"] += 1
-
-            verify_token_ids = verify["token_ids"]
             forced_reject = args.force_reject_step == verify_step
-            is_accepted = verify_token_ids == [draft_token_id] and not forced_reject
+            if draft_token_id == target_token_id and not forced_reject:
+                accept_len += 1
+                continue
+            reject_index = i
+            break
 
-            if is_accepted:
-                llm.scheduler.postprocess(verify_seqs, [draft_token_id], False)
-                stats["accepted_tokens"] += 1
-                committed_token_ids = [draft_token_id]
-                max_rerun_logit_diff = None
-            else:
-                restore_scheduler(llm, seq, scheduler_snapshot)
-                llm.model_runner.call("restore_decode_state", snapshot_name)
-                call_started = perf_counter()
-                rerun = llm.model_runner.call(
-                    "run_step_probe",
-                    verify_seqs,
-                    False,
-                    args.top_k,
-                    None,
-                    snapshot_name,
-                )
-                stats["rerun_call_seconds"] += perf_counter() - call_started
-                stats["target_forwards"] += 1
-                stats["decode_forwards"] += 1
-                stats["reject_reruns"] += 1
-                assert rerun["token_ids"] == verify_token_ids
-                llm.scheduler.postprocess(verify_seqs, rerun["token_ids"], False)
-                stats["rejected_tokens"] += 1
-                committed_token_ids = rerun["token_ids"]
-                max_rerun_logit_diff = rerun["max_logit_diff"]
+        stats["accept_length_total"] += accept_len
+        stats["max_accept_length"] = max(stats["max_accept_length"], accept_len)
+        stats["compared_tokens"] += accept_len + int(reject_index is not None)
 
-            llm.model_runner.call("drop_decode_state", snapshot_name)
-            generated_tokens += len(committed_token_ids)
+        if reject_index is None:
+            stats["accepted_tokens"] += accept_len
+            committed_token_ids = commit_tokens(llm, seq, draft_token_ids)
+            max_rerun_logit_diff = None
+            rejected_target_ids = []
+        else:
+            stats["accepted_tokens"] += accept_len
+            stats["rejected_tokens"] += 1
+            stats["discarded_draft_tokens"] += verify_len - accept_len - 1
+            stats["wasted_verified_tokens_after_reject"] += verify_len - accept_len - 1
+            rejected_target_ids = [target_token_ids[reject_index]]
 
-            if generated_tokens <= args.verbose_steps:
-                print(
-                    f"verify token {generated_tokens}: "
-                    f"draft={[draft_token_id]} {tokenizer.decode([draft_token_id])!r} "
-                    f"target={verify_token_ids} {tokenizer.decode(verify_token_ids)!r} "
-                    f"accept={is_accepted} forced_reject={forced_reject}",
-                    flush=True,
-                )
-                if max_rerun_logit_diff is not None:
-                    print(f"  reject rerun max_logit_diff={max_rerun_logit_diff}", flush=True)
+            restore_scheduler(llm, seq, scheduler_snapshot)
+            llm.model_runner.call("restore_decode_state", snapshot_name)
+            rerun_input_ids = [seq.last_token] + draft_token_ids[:accept_len]
+            ensure_block_capacity(llm, seq, start_pos + len(rerun_input_ids))
+            call_started = perf_counter()
+            rerun = llm.model_runner.call(
+                "run_verify_batch_probe",
+                [seq],
+                rerun_input_ids,
+                start_pos,
+                args.top_k,
+                None,
+                snapshot_name,
+            )
+            stats["rerun_call_seconds"] += perf_counter() - call_started
+            stats["reject_reruns"] += 1
+            stats["reject_rerun_input_tokens"] += len(rerun_input_ids)
+            stats["target_forwards"] += len(rerun_input_ids)
+            stats["decode_forwards"] += len(rerun_input_ids)
+            assert rerun["token_ids"] == target_token_ids[:len(rerun_input_ids)]
+            committed_token_ids = commit_tokens(
+                llm,
+                seq,
+                draft_token_ids[:accept_len] + [rerun["token_ids"][-1]],
+            )
+            max_rerun_logit_diff = rerun["max_logit_diff"]
 
-            if not is_accepted:
-                break
+        llm.model_runner.call("drop_decode_state", snapshot_name)
+        generated_tokens += len(committed_token_ids)
+
+        if generated_tokens <= args.verbose_steps:
+            print(
+                f"verify batch: size={verify_len} accept_len={accept_len} "
+                f"targets={target_token_ids} {tokenizer.decode(target_token_ids)!r} "
+                f"rejected_target={rejected_target_ids} forced_reject={forced_reject}",
+                flush=True,
+            )
+            print(
+                f"  committed: {committed_token_ids} "
+                f"{tokenizer.decode(committed_token_ids)!r}",
+                flush=True,
+            )
+            if max_rerun_logit_diff is not None:
+                print(f"  reject rerun max_logit_diff={max_rerun_logit_diff}", flush=True)
 
     stats["wall_seconds"] = perf_counter() - started
     token_ids = list(seq.completion_token_ids)
@@ -240,9 +303,19 @@ def run_speculative(args, tokenizer, prompt):
 
 def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
     generated = max(len(spec_ids), 1)
-    attempts = spec_stats["draft_token_attempts"]
+    attempts = max(spec_stats["compared_tokens"], 1)
     accepted = spec_stats["accepted_tokens"]
-    accept_rate = accepted / attempts if attempts else 0.0
+    accept_rate = accepted / attempts
+    avg_verify_batch_size = (
+        spec_stats["verify_batch_tokens"] / spec_stats["verify_batches"]
+        if spec_stats["verify_batches"]
+        else 0.0
+    )
+    avg_accept_length = (
+        spec_stats["accept_length_total"] / spec_stats["verify_batches"]
+        if spec_stats["verify_batches"]
+        else 0.0
+    )
 
     print("\n=== ALIGNMENT ===", flush=True)
     if greedy_ids is not None:
@@ -255,16 +328,28 @@ def print_stats(greedy_ids, greedy_stats, spec_ids, spec_stats):
     print("\n=== SPEC STATS ===", flush=True)
     print(f"draft_len: {spec_stats['draft_len']}", flush=True)
     print(f"draft_rounds: {spec_stats['draft_rounds']}", flush=True)
-    print(f"draft_token_attempts: {attempts}", flush=True)
+    print(f"verify_batches: {spec_stats['verify_batches']}", flush=True)
+    print(f"verify_batch_tokens: {spec_stats['verify_batch_tokens']}", flush=True)
+    print(f"avg_verify_batch_size: {avg_verify_batch_size:.3f}", flush=True)
+    print(f"max_verify_batch_size: {spec_stats['max_verify_batch_size']}", flush=True)
+    print(f"draft_token_attempts: {spec_stats['draft_token_attempts']}", flush=True)
+    print(f"compared_tokens: {spec_stats['compared_tokens']}", flush=True)
+    print(f"accept_length_total: {spec_stats['accept_length_total']}", flush=True)
+    print(f"avg_accept_length: {avg_accept_length:.3f}", flush=True)
+    print(f"max_accept_length: {spec_stats['max_accept_length']}", flush=True)
     print(f"accepted_tokens: {accepted}", flush=True)
     print(f"rejected_tokens: {spec_stats['rejected_tokens']}", flush=True)
     print(f"accept_rate: {accept_rate:.2%}", flush=True)
+    print(f"discarded_draft_tokens: {spec_stats['discarded_draft_tokens']}", flush=True)
+    print(f"wasted_verified_tokens_after_reject: {spec_stats['wasted_verified_tokens_after_reject']}", flush=True)
     print(f"target_forwards: {spec_stats['target_forwards']}", flush=True)
     print(f"mtp_forwards: {spec_stats['mtp_forwards']}", flush=True)
     print(f"reject_reruns: {spec_stats['reject_reruns']}", flush=True)
+    print(f"reject_rerun_input_tokens: {spec_stats['reject_rerun_input_tokens']}", flush=True)
     print(f"target_forwards_per_token: {spec_stats['target_forwards'] / generated:.3f}", flush=True)
     print(f"mtp_forwards_per_token: {spec_stats['mtp_forwards'] / generated:.3f}", flush=True)
     print(f"reject_reruns_per_token: {spec_stats['reject_reruns'] / generated:.3f}", flush=True)
+    print(f"reject_rerun_input_tokens_per_token: {spec_stats['reject_rerun_input_tokens'] / generated:.3f}", flush=True)
     if greedy_stats is not None:
         delta = spec_stats["target_forwards"] - greedy_stats["target_forwards"]
         print(f"greedy_target_forwards: {greedy_stats['target_forwards']}", flush=True)
