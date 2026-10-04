@@ -129,12 +129,13 @@ python -m pip install -e .
 If your environment already has PyTorch, Triton, and FlashAttention installed, the
 editable install is enough.
 
-`nanovllm/utils/image_processing.py` imports `PIL` and `torchvision`, which are not yet
-listed in `pyproject.toml`. Install them as well (use a `torchvision` build that matches
-your `torch`):
+`pillow` and `torchvision` are required because `nanovllm/utils/image_processing.py`
+imports them. Install a `torchvision` build that matches your `torch` first; otherwise pip
+may replace your CUDA build of `torch` when it resolves `torchvision`. For example, with
+`torch 2.9.1+cu128`:
 
 ```bash
-python -m pip install pillow torchvision
+python -m pip install torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ## Model Download
