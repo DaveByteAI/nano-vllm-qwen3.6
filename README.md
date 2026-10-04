@@ -1,11 +1,73 @@
 # Nano-vLLM Qwen3.5/Qwen3.6
 
+**English** | [中文](README_zh.md)
+
+<p align="center"><img src="assets/hero.svg" alt="Nano-vLLM Qwen3.5/3.6: a readable inference engine for hybrid Qwen models. 41 tok/s Qwen3.5-9B BF16 decode on one RTX 3090; decode GEMMs reach 83% of memory bandwidth; 138 tok/s aggregate with 4 requests; 41 tok/s Qwen3.6-27B-FP8 on 4x RTX 4090." width="100%"></p>
+
+<p align="center"><img src="assets/architecture.svg" alt="Architecture: LLM.generate -> LLMEngine -> Scheduler -> ModelRunner -> Qwen3.5 model. The 32-layer decoder interleaves 3 GatedDeltaNet layers with 1 full-attention layer." width="100%"></p>
+
 A compact, readable inference engine based on `nano-vllm`, extended for Qwen3.5 hybrid
 models and Qwen3.6 FP8 text-only inference experiments.
 
 This repository is intended for learning how LLM inference engines work: tensor
 parallelism, KV cache allocation, CUDA Graph decode, hybrid linear-attention state,
 and quantized checkpoint loading are all implemented in a small codebase.
+
+## Single RTX 3090: Results and Profile
+
+Qwen3.5-9B BF16 on one RTX 3090 (24 GB, 936 GB/s), PyTorch 2.9.1 + CUDA 12.8,
+flash-attn 2.8.3, batch 1, greedy decoding:
+
+| Metric | Measured |
+|---|---|
+| Decode, CUDA Graph | 24.2 ms/token, **41.4 tok/s** |
+| Decode, `--eager` | ~17 tok/s |
+| Decode, 4 concurrent requests | 29.0 ms/step, **138 tok/s** aggregate |
+| Prefill, 16 / 128 / 512 / 2048 tokens | 238 / 254 / 378 / 899 ms |
+| Peak GPU memory (`gpu_memory_utilization=0.9`) | 21.5 GB |
+
+<p align="center"><img src="assets/profile.svg" alt="Profile: a decode step spends 20.5 ms (79%) in weight GEMM/GEMV at about 780 GB/s and 5.3 ms (21%) in about 2,200 small kernels. Prefill latency is 238 ms even for 16 tokens because the GDN chunk path is CPU-bound." width="100%"></p>
+
+What the profile says:
+
+- **Decode is memory-bandwidth bound.** Every token reads 15.87 GB of weights
+  (MLP 9.66 GB, GatedDeltaNet 3.24 GB, lm_head 2.03 GB, full attention 0.94 GB).
+  At 936 GB/s that is a 17.0 ms floor (58 tok/s). The GEMM/GEMV kernels already run at
+  about 780 GB/s, 83% of peak.
+- **About 21% of a decode step is small kernels.** A step launches 2,263 kernels.
+  Most of the non-GEMM time comes from the GatedDeltaNet decode path: the 2 MB fp32
+  recurrent state of each layer is gathered with fancy indexing, updated by several
+  separate elementwise/reduction passes, and scattered back. The four input
+  projections (`in_proj_qkv/z/b/a`) also run as separate GEMVs.
+- **Short-prompt prefill is CPU-bound.** `chunk_gated_delta_rule` runs a 63-step Python
+  loop per 64-token chunk in each of the 24 GDN layers, and the prefill path calls
+  `.item()` on `cu_seqlens`. A 512-token prefill issues about 14.5k kernel launches,
+  and the CPU time (409 ms) is roughly twice the GPU time (212 ms).
+- **Batching is cheap.** Four concurrent requests cost only 20% more per step than one.
+
+## Optimization Roadmap
+
+<p align="center"><img src="assets/roadmap.svg" alt="Roadmap with estimated decode speed: today 41.4 tok/s measured; Triton chunk prefill leaves decode unchanged but cuts TTFT; fused GDN decode about 48 to 50 tok/s; INT8 weight-only about 80 tok/s; INT4 weight-only about 110 to 125 tok/s." width="100%"></p>
+
+None of these are implemented yet. The numbers are estimates derived from the
+profile above, not measurements.
+
+1. **Triton chunk kernel for GDN prefill.** Replace the Python loop in
+   `chunk_gated_delta_rule` with a chunked Triton kernel (as in
+   flash-linear-attention) and remove the `.item()` syncs. Expected: short-prompt TTFT
+   from 238 ms to roughly 30-50 ms.
+2. **Fuse the GDN decode path.** A single kernel that updates the recurrent state in
+   place via `state_indices`, plus merged input projections, should remove most of the
+   ~5 ms of small kernels: ~41 to ~48-50 tok/s.
+3. **INT8 weight-only (W8A16).** Decode speed tracks weight bytes, so halving them gives
+   ~80 tok/s.
+4. **INT4 weight-only (AWQ/GPTQ with Marlin-style kernels, which support sm_86).**
+   ~4.5 GB per token gives ~110-125 tok/s. It would also let Qwen3.6-27B (~15 GB in
+   INT4) run on one 24 GB card. The current FP8 path dequantizes to BF16 and needs 4 GPUs.
+
+Smaller items: `enable_vision` defaults to `True`, so text-only runs also load the
+0.91 GB vision encoder. The default `max_num_seqs=512` captures 36 CUDA graphs at
+startup, which single-request tests do not need.
 
 ## What Works
 
@@ -66,6 +128,14 @@ python -m pip install -e .
 
 If your environment already has PyTorch, Triton, and FlashAttention installed, the
 editable install is enough.
+
+`nanovllm/utils/image_processing.py` imports `PIL` and `torchvision`, which are not yet
+listed in `pyproject.toml`. Install them as well (use a `torchvision` build that matches
+your `torch`):
+
+```bash
+python -m pip install pillow torchvision
+```
 
 ## Model Download
 
@@ -232,11 +302,12 @@ python bench_qwen35_fixed.py \
   --repeats 3
 ```
 
-Recent local smoke-test results on RTX 4090 hardware:
+Recent local smoke-test results:
 
 ```text
-Qwen3.6-27B-FP8, TP=4, CUDA Graph decode: Decode ~= 41 tok/s
-Qwen3.5-9B, TP=4, CUDA Graph decode:       Decode ~= 98 tok/s
+RTX 4090 x4: Qwen3.6-27B-FP8, TP=4, CUDA Graph decode: Decode ~= 41 tok/s
+RTX 4090 x4: Qwen3.5-9B,      TP=4, CUDA Graph decode: Decode ~= 98 tok/s
+RTX 3090 x1: Qwen3.5-9B BF16, TP=1, CUDA Graph decode: Decode ~= 41 tok/s
 ```
 
 These are simple single-request smoke tests, not full serving benchmarks.
