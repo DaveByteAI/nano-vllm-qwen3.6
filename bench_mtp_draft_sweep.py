@@ -61,9 +61,9 @@ def main():
         )
 
     print(
-        "draft_len\tmatch\ttokens\ttok_s\tseconds\taccept_rate\t"
+        "draft_len\tmatch\ttokens\ttok_s\tseconds\taccept_rate\tmean_accept_len\t"
         "target_fw_per_tok\tmtp_fw_per_tok\tverify_graph_replays\tverify_eager_calls\t"
-        "verify_chunk_calls\treject_reruns",
+        "verify_chunk_calls\treject_reruns\tmtp_kv_gaps",
         flush=True,
     )
     for draft_len in parse_draft_lens(args.draft_lens):
@@ -76,12 +76,14 @@ def main():
             f"{summary['decode_tok_s']:.4f}\t"
             f"{summary['model_call_seconds']:.4f}\t"
             f"{summary['accept_rate']:.4f}\t"
+            f"{summary['mean_accept_length']:.4f}\t"
             f"{summary['target_forwards_per_token']:.4f}\t"
             f"{summary['mtp_forwards_per_token']:.4f}\t"
             f"{summary['verify_graph_replays']}\t"
             f"{summary['verify_eager_calls']}\t"
             f"{summary['verify_chunk_calls']}\t"
-            f"{summary['reject_reruns']}",
+            f"{summary['reject_reruns']}\t"
+            f"{summary['mtp_kv_gaps']}",
             flush=True,
         )
 

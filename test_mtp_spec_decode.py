@@ -167,6 +167,18 @@ def commit_tokens(llm, seq, token_ids):
     return committed
 
 
+def release_draft_blocks(llm, seq):
+    """Drop KV blocks reserved for drafted positions when no verify consumes them."""
+    from nanovllm.engine.sequence import SequenceStatus
+
+    if not seq.block_table:
+        return
+    if seq.status == SequenceStatus.WAITING:    # mid chunked prefill: keep the whole prompt
+        trim_block_table_to_context(llm, seq, len(seq))
+    else:
+        finalize_manual_commit(llm, seq)
+
+
 def trusted_verify_mode(args):
     return "eager" if args.verify_mode == "eager" else "graph"
 
@@ -239,6 +251,8 @@ def run_speculative(args, tokenizer, prompt):
         round_draft_len = max(0, min(args.draft_len, remaining - 1))
 
         seqs, is_prefill = llm.scheduler.schedule()
+        # Drafted positions write MTP KV, so reserve their blocks before drafting.
+        ensure_block_capacity(llm, seq, len(seq) + round_draft_len)
         call_started = perf_counter()
         draft_result = llm.model_runner.call(
             "run_mtp_draft_step",
@@ -296,6 +310,7 @@ def run_speculative(args, tokenizer, prompt):
         remaining_after_main = args.max_tokens - seq.num_completion_tokens
         draft_token_ids = draft_token_ids[:remaining_after_main]
         if not draft_token_ids:
+            release_draft_blocks(llm, seq)
             if trace is not None:
                 event["output_end"] = seq.num_completion_tokens
                 trace.append(event)

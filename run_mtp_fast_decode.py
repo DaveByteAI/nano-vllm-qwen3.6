@@ -11,6 +11,7 @@ from test_mtp_spec_decode import (
     decode_text,
     ensure_block_capacity,
     finalize_manual_commit,
+    release_draft_blocks,
     trusted_verify_mode,
 )
 
@@ -125,6 +126,7 @@ def run_mtp_fast_decode(args, prompt):
         "main_call_seconds": 0.0,
         "verify_call_seconds": 0.0,
         "rerun_call_seconds": 0.0,
+        "mtp_kv_gaps": 0,
     }
 
     started = perf_counter()
@@ -133,6 +135,8 @@ def run_mtp_fast_decode(args, prompt):
         round_draft_len = max(0, min(args.draft_len, remaining - 1))
 
         seqs, is_prefill = llm.scheduler.schedule()
+        # Drafted positions write MTP KV, so reserve their blocks before drafting.
+        ensure_block_capacity(llm, seq, len(seq) + round_draft_len)
         call_started = perf_counter()
         draft_result = llm.model_runner.call(
             "run_mtp_draft_fast_step",
@@ -144,6 +148,7 @@ def run_mtp_fast_decode(args, prompt):
         stats["target_forwards"] += 1
         stats["mtp_forwards"] += draft_result["mtp_forwards"]
         stats["draft_rounds"] += int(round_draft_len > 0)
+        stats["mtp_kv_gaps"] = draft_result["mtp_kv_gaps"]
 
         main_token_ids = draft_result["main_token_ids"]
         draft_token_ids = draft_result["draft_token_ids"]
@@ -154,6 +159,7 @@ def run_mtp_fast_decode(args, prompt):
         remaining_after_main = args.max_tokens - seq.num_completion_tokens
         draft_token_ids = draft_token_ids[:remaining_after_main]
         if not draft_token_ids:
+            release_draft_blocks(llm, seq)
             continue
 
         verify_len = len(draft_token_ids)
@@ -282,6 +288,8 @@ def summarize_stats(token_count, stats):
         "chunk_checked_batches": stats.get("chunk_checked_batches", 0),
         "chunk_token_mismatches": stats.get("chunk_token_mismatches", 0),
         "reject_reruns": stats.get("reject_reruns", 0),
+        "mean_accept_length": stats.get("accept_length_total", 0) / max(stats.get("verify_batches", 0), 1),
+        "mtp_kv_gaps": stats.get("mtp_kv_gaps", 0),
     }
 
 

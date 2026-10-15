@@ -47,6 +47,12 @@ class ModelRunner:
         self.event = event
         self.decode_state_snapshots = {}
         self.logit_probe_refs = {}
+        # MTP KV bookkeeping: positions [0, mtp_kv_end) hold MTP KV built from target
+        # hidden states; pending rows are verified target hidden states not yet written.
+        self.mtp_kv_end = 0
+        self.mtp_kv_gaps = 0
+        self.mtp_pending_start = -1
+        self.mtp_pending_hidden = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -571,32 +577,39 @@ class ModelRunner:
             dist.all_reduce(local_diff, op=dist.ReduceOp.MAX)
         return float(local_diff.item())
 
+    def _forward_hidden(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool,
+                        pixel_values=None, image_grid_thw=None, image_token_mask=None):
+        """Return final hidden states; decode replays a CUDA graph and returns a view of its output buffer."""
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            return self.model(input_ids, positions,
+                              pixel_values=pixel_values,
+                              image_grid_thw=image_grid_thw,
+                              image_token_mask=image_token_mask)
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        if self.config.is_hybrid:
+            graph_vars["state_indices"][:bs] = context.state_indices
+        graph.replay()
+        return graph_vars["outputs"][:bs]
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool,
                   pixel_values=None, image_grid_thw=None, image_token_mask=None):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(
-                self.model(input_ids, positions,
-                           pixel_values=pixel_values,
-                           image_grid_thw=image_grid_thw,
-                           image_token_mask=image_token_mask)
-            )
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            if self.config.is_hybrid:
-                graph_vars["state_indices"][:bs] = context.state_indices
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        return self.model.compute_logits(
+            self._forward_hidden(input_ids, positions, is_prefill,
+                                 pixel_values=pixel_values,
+                                 image_grid_thw=image_grid_thw,
+                                 image_token_mask=image_token_mask)
+        )
 
     def _broadcast_image_data(self, pixel_values, image_grid_thw, image_token_mask, positions, is_3d_positions):
         """Broadcast multimodal tensors from rank 0 to all TP workers.
@@ -764,10 +777,13 @@ class ModelRunner:
         token_ids = []
         topk = []
         logits_parts = []
+        hidden_parts = []
         for i, next_input_token_id in enumerate(input_token_ids):
             assert work_seq.last_token == next_input_token_id
             input_ids, positions = self.prepare_decode([work_seq])
-            logits = self.run_model(input_ids, positions, False)
+            hidden_states = self._forward_hidden(input_ids, positions, False)
+            hidden_parts.append(hidden_states.clone())
+            logits = self.model.compute_logits(hidden_states)
             logits_parts.append(logits.float())
             sampled_token_ids = self.sample(logits, None, greedy=True)
             sampled_topk = self.topk_tokens(logits, top_k)
@@ -779,6 +795,7 @@ class ModelRunner:
                 work_seq.append_token(input_token_ids[i + 1])
                 work_seq.num_cached_tokens += 1
 
+        self._stash_mtp_hidden(start_pos, torch.cat(hidden_parts, dim=0))
         logits_float = torch.cat(logits_parts, dim=0)
         max_logit_diff = self._compare_logits(logits_float, compare_logits_to)
 
@@ -840,6 +857,7 @@ class ModelRunner:
             vars["state_indices"].copy_(self.verify_cpu_state_indices, non_blocking=True)
 
         self.verify_graphs[verify_len].replay()
+        self._stash_mtp_hidden(start_pos, vars["outputs"][:verify_len])
         logits = self.model.compute_logits(vars["outputs"][:verify_len])
         logits_float = logits.float()
         token_ids = self.sample(logits, None, greedy=True)
@@ -932,6 +950,7 @@ class ModelRunner:
             "chunk verify is text-only"
         hidden_states = self.model(input_ids, positions)
         reset_context()
+        self._stash_mtp_hidden(start_pos, hidden_states)
         logits = self.model.compute_logits(hidden_states)
         logits_float = logits.float()
         token_ids = self.sample(logits, None, greedy=True)
@@ -1007,6 +1026,7 @@ class ModelRunner:
         vars, verify_len, context_len = self._copy_verify_chunk_graph_inputs(seqs, input_token_ids, start_pos)
         self.verify_chunk_graphs[verify_len].replay()
         reset_context()
+        self._stash_mtp_hidden(start_pos, vars["outputs"][:verify_len])
         logits = self.model.compute_logits(vars["outputs"][:verify_len])
         logits_float = logits.float()
         token_ids = self.sample(logits, None, greedy=True)
@@ -1056,10 +1076,13 @@ class ModelRunner:
         work_seq.token_ids = list(seq.token_ids)
         work_seq.block_table = list(seq.block_table)
         token_ids = []
+        hidden_parts = []
         for i, next_input_token_id in enumerate(input_token_ids):
             assert work_seq.last_token == next_input_token_id
             input_ids, positions = self.prepare_decode([work_seq])
-            logits = self.run_model(input_ids, positions, False)
+            hidden_states = self._forward_hidden(input_ids, positions, False)
+            hidden_parts.append(hidden_states.clone())
+            logits = self.model.compute_logits(hidden_states)
             sampled_token_ids = self.sample(logits, None, greedy=True)
             if self.rank == 0:
                 token_ids.extend(sampled_token_ids)
@@ -1068,6 +1091,7 @@ class ModelRunner:
                 work_seq.append_token(input_token_ids[i + 1])
                 work_seq.num_cached_tokens += 1
 
+        self._stash_mtp_hidden(start_pos, torch.cat(hidden_parts, dim=0))
         if self.rank != 0:
             return None
         return {
@@ -1115,6 +1139,7 @@ class ModelRunner:
             vars["state_indices"].copy_(self.verify_cpu_state_indices, non_blocking=True)
 
         self.verify_graphs[verify_len].replay()
+        self._stash_mtp_hidden(start_pos, vars["outputs"][:verify_len])
         logits = self.model.compute_logits(vars["outputs"][:verify_len])
         token_ids = self.sample(logits, None, greedy=True)
 
@@ -1137,6 +1162,7 @@ class ModelRunner:
             vars, _, _ = self._copy_verify_chunk_graph_inputs(seqs, input_token_ids, start_pos)
             self.verify_chunk_graphs[verify_len].replay()
             reset_context()
+            self._stash_mtp_hidden(start_pos, vars["outputs"][:verify_len])
             logits = self.model.compute_logits(vars["outputs"][:verify_len])
             token_ids = self.sample(logits, None, greedy=True)
 
@@ -1156,6 +1182,7 @@ class ModelRunner:
             "chunk verify is text-only"
         hidden_states = self.model(input_ids, positions)
         reset_context()
+        self._stash_mtp_hidden(start_pos, hidden_states)
         logits = self.model.compute_logits(hidden_states)
         token_ids = self.sample(logits, None, greedy=True)
 
@@ -1197,112 +1224,159 @@ class ModelRunner:
             verify_mode,
         )
 
+    def _stash_mtp_hidden(self, start_pos: int, hidden_states: torch.Tensor):
+        """Keep target hidden states of verified positions for the next MTP KV catch-up.
+
+        The last verify call of a round (trusted verify or reject rerun) wins, so the
+        pending rows always come from target inputs that were actually committed.
+        """
+        if getattr(self.model, "mtp", None) is None:
+            return
+        self.mtp_pending_start = start_pos
+        self.mtp_pending_hidden = hidden_states.detach().clone()
+
+    def _broadcast_token_ids(self, token_ids: list[int] | None, n: int) -> torch.Tensor:
+        token_tensor = torch.empty(n, dtype=torch.int64, device="cuda")
+        if self.rank == 0:
+            token_tensor.copy_(torch.tensor(token_ids, dtype=torch.int64, device="cuda"))
+        if self.world_size > 1:
+            dist.broadcast(token_tensor, src=0)
+        return token_tensor
+
+    def _run_mtp_cached(
+        self,
+        seq: Sequence,
+        start_pos: int,
+        hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ):
+        """Run the MTP head over consecutive positions using its own paged KV cache.
+
+        Row i pairs the hidden state at position start_pos + i with the embedding of the
+        token at position start_pos + i + 1, and writes MTP KV at position start_pos + i.
+        Returns the last row's MTP hidden state and logits.
+        """
+        n = hidden_states.size(0)
+        context_len = start_pos + n
+        needed_blocks = (context_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks, \
+            f"MTP needs KV blocks up to position {context_len - 1}; call ensure_block_capacity first"
+        positions = torch.arange(start_pos, context_len, dtype=torch.int64, device="cuda")
+        cu_seqlens_q = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+        cu_seqlens_k = torch.tensor([0, context_len], dtype=torch.int32, device="cuda")
+        slot_mapping = torch.tensor(
+            self._kv_slots_for_positions(seq, start_pos, n), dtype=torch.int32, device="cuda"
+        )
+        block_tables = torch.tensor([seq.block_table[:needed_blocks]], dtype=torch.int32, device="cuda")
+        set_context(True, cu_seqlens_q, cu_seqlens_k, n, context_len, slot_mapping, None, block_tables)
+        inputs_embeds = self.model.model.embed_tokens(next_token_ids)
+        mtp_hidden = self.model.mtp(positions, hidden_states, inputs_embeds)
+        logits = self.model.compute_logits(mtp_hidden)    # last row only (prefill context)
+        reset_context()
+        return mtp_hidden[-1:].contiguous(), logits
+
     def _run_mtp_draft(
         self,
         seqs: list[Sequence],
         is_prefill: bool,
-        top_k: int = 5,
         draft_len: int = 1,
+        top_k: int | None = None,
     ):
+        """Main-model step followed by MTP drafting with a real MTP KV context.
+
+        MTP KV is kept for every position whose target hidden state is known: the prompt
+        on prefill, and on decode the positions verified by the previous round (stashed by
+        the verify calls) plus the current position. Drafted positions beyond that are
+        written speculatively and get overwritten by the next round's catch-up.
+        """
         assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
-        assert len(seqs) == 1, "MTP probe currently supports batch size 1"
+        assert len(seqs) == 1, "MTP draft currently supports batch size 1"
         assert draft_len >= 0
+        seq = seqs[0]
 
         if is_prefill:
             input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
             assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
-                "MTP probe is text-only"
-            assert positions.ndim == 1, "MTP probe expects 1D text positions"
+                "MTP draft is text-only"
+            assert positions.ndim == 1, "MTP draft expects 1D text positions"
         else:
             input_ids, positions = self.prepare_decode(seqs)
-
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            pixel_values=None,
-            image_grid_thw=None,
-            image_token_mask=None,
-        )
-        context = get_context()
-        if is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            main_hidden = hidden_states[last_indices].contiguous()
-            mtp_positions = positions[last_indices].contiguous() + 1
-        else:
-            main_hidden = hidden_states
-            mtp_positions = positions.contiguous() + 1
+        hidden_states = self._forward_hidden(input_ids, positions, is_prefill)
         logits = self.model.compute_logits(hidden_states)
         main_token_ids = self.sample(logits, None, greedy=True)
+        reset_context()
 
-        main_token_tensor = torch.empty(main_hidden.size(0), dtype=torch.int64, device="cuda")
+        if is_prefill:
+            start_pos = min(seq.num_cached_tokens, len(seq) - 1)
+            if start_pos == 0:
+                self.mtp_kv_end = 0
+            final_chunk = start_pos + seq.num_scheduled_tokens >= len(seq)
+            target_hidden = hidden_states
+        else:
+            cur_pos = len(seq) - 1
+            pending = self.mtp_pending_hidden
+            if (
+                pending is not None
+                and self.mtp_pending_start == self.mtp_kv_end
+                and self.mtp_pending_start + pending.size(0) == cur_pos
+            ):
+                start_pos = self.mtp_pending_start
+                target_hidden = torch.cat([pending, hidden_states], dim=0)
+            else:
+                start_pos = cur_pos
+                target_hidden = hidden_states
+            final_chunk = True
+        self.mtp_pending_hidden = None
+        if start_pos != self.mtp_kv_end:
+            self.mtp_kv_gaps += 1
+        num_rows = target_hidden.size(0)
+
+        next_ids = None
         if self.rank == 0:
-            main_token_tensor.copy_(torch.tensor(main_token_ids, dtype=torch.int64, device="cuda"))
-        if self.world_size > 1:
-            dist.broadcast(main_token_tensor, src=0)
+            next_ids = list(seq.token_ids[start_pos + 1:start_pos + num_rows])
+            next_ids.append(main_token_ids[0] if final_chunk else seq.token_ids[start_pos + num_rows])
+        next_token_tensor = self._broadcast_token_ids(next_ids, num_rows)
+        mtp_hidden, draft_logits = self._run_mtp_cached(seq, start_pos, target_hidden, next_token_tensor)
+        self.mtp_kv_end = start_pos + num_rows
+        mtp_forwards = 1
 
-        current_hidden = main_hidden
-        current_positions = mtp_positions
-        current_token_tensor = main_token_tensor
         draft_token_ids = []
         draft_topk = []
-        mtp_hidden_shape = None
-        draft_logits_shape = None
-        for _ in range(draft_len):
-            inputs_embeds = self.model.model.embed_tokens(current_token_tensor)
-            cu_seqlens = torch.arange(
-                current_hidden.size(0) + 1,
-                dtype=torch.int32,
-                device="cuda",
-            )
-            slot_mapping = torch.full(
-                (current_hidden.size(0),),
-                -1,
-                dtype=torch.int32,
-                device="cuda",
-            )
-            set_context(
-                True,
-                cu_seqlens,
-                cu_seqlens,
-                1,
-                1,
-                slot_mapping,
-                None,
-                None,
-                state_indices=None,
-            )
-            mtp_hidden = self.model.mtp(current_positions, current_hidden, inputs_embeds)
-            draft_logits = self.model.compute_logits(mtp_hidden)
+        if not final_chunk:
+            draft_len = 0
+        for i in range(draft_len):
             next_token_ids = self.sample(draft_logits, None, greedy=True)
-            next_topk = self.topk_tokens(draft_logits, top_k)
-            next_token_tensor = torch.empty(current_hidden.size(0), dtype=torch.int64, device="cuda")
+            if top_k is not None:
+                next_topk = self.topk_tokens(draft_logits, top_k)
             if self.rank == 0:
                 draft_token_ids.append(next_token_ids[0])
-                draft_topk.append(next_topk[0])
-                next_token_tensor.copy_(torch.tensor(next_token_ids, dtype=torch.int64, device="cuda"))
-            if self.world_size > 1:
-                dist.broadcast(next_token_tensor, src=0)
-            current_hidden = mtp_hidden
-            current_positions = current_positions + 1
-            current_token_tensor = next_token_tensor
-            mtp_hidden_shape = tuple(mtp_hidden.shape)
-            draft_logits_shape = tuple(draft_logits.shape)
-        reset_context()
+                if top_k is not None:
+                    draft_topk.append(next_topk[0])
+            if i == draft_len - 1:
+                break
+            next_token_tensor = self._broadcast_token_ids(next_token_ids, 1)
+            mtp_hidden, draft_logits = self._run_mtp_cached(
+                seq, self.mtp_kv_end + i, mtp_hidden, next_token_tensor
+            )
+            mtp_forwards += 1
 
         if self.rank != 0:
             return None
-        return {
+        result = {
             "main_token_ids": main_token_ids,
             "draft_token_ids": draft_token_ids,
-            "draft_topk": draft_topk,
-            "main_hidden_shape": tuple(main_hidden.shape),
-            "mtp_hidden_shape": mtp_hidden_shape,
-            "draft_logits_shape": draft_logits_shape,
-            "draft_len": draft_len,
-            "mtp_forwards": draft_len,
-            "mtp_loaded_count": len([name for name in self.load_result.loaded_names if name.startswith("mtp.")]),
-            "mtp_skipped_count": len([name for name in self.load_result.skipped_names if name.startswith("mtp.")]),
+            "mtp_forwards": mtp_forwards,
+            "mtp_catchup_rows": num_rows,
+            "mtp_kv_gaps": self.mtp_kv_gaps,
         }
+        if top_k is not None:
+            result.update({
+                "draft_topk": draft_topk,
+                "draft_len": draft_len,
+                "mtp_loaded_count": len([n for n in self.load_result.loaded_names if n.startswith("mtp.")]),
+                "mtp_skipped_count": len([n for n in self.load_result.skipped_names if n.startswith("mtp.")]),
+            })
+        return result
 
     @torch.inference_mode()
     def run_mtp_probe(self, seqs: list[Sequence], top_k: int = 5):
@@ -1310,80 +1384,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_mtp_draft_step(self, seqs: list[Sequence], is_prefill: bool, top_k: int = 5, draft_len: int = 1):
-        return self._run_mtp_draft(seqs, is_prefill=is_prefill, top_k=top_k, draft_len=draft_len)
+        return self._run_mtp_draft(seqs, is_prefill=is_prefill, draft_len=draft_len, top_k=top_k)
 
     @torch.inference_mode()
     def run_mtp_draft_fast_step(self, seqs: list[Sequence], is_prefill: bool, draft_len: int = 1):
-        assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
-        assert len(seqs) == 1, "MTP fast path currently supports batch size 1"
-        assert draft_len >= 0
-
-        if is_prefill:
-            input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
-            assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
-                "MTP fast path is text-only"
-            assert positions.ndim == 1, "MTP fast path expects 1D text positions"
-        else:
-            input_ids, positions = self.prepare_decode(seqs)
-
-        hidden_states = self.model(input_ids, positions)
-        context = get_context()
-        if is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            main_hidden = hidden_states[last_indices].contiguous()
-            mtp_positions = positions[last_indices].contiguous() + 1
-        else:
-            main_hidden = hidden_states
-            mtp_positions = positions.contiguous() + 1
-        logits = self.model.compute_logits(hidden_states)
-        main_token_ids = self.sample(logits, None, greedy=True)
-
-        main_token_tensor = torch.empty(main_hidden.size(0), dtype=torch.int64, device="cuda")
-        if self.rank == 0:
-            main_token_tensor.copy_(torch.tensor(main_token_ids, dtype=torch.int64, device="cuda"))
-        if self.world_size > 1:
-            dist.broadcast(main_token_tensor, src=0)
-
-        current_hidden = main_hidden
-        current_positions = mtp_positions
-        current_token_tensor = main_token_tensor
-        draft_token_ids = []
-        for _ in range(draft_len):
-            inputs_embeds = self.model.model.embed_tokens(current_token_tensor)
-            cu_seqlens = torch.arange(current_hidden.size(0) + 1, dtype=torch.int32, device="cuda")
-            slot_mapping = torch.full((current_hidden.size(0),), -1, dtype=torch.int32, device="cuda")
-            set_context(
-                True,
-                cu_seqlens,
-                cu_seqlens,
-                1,
-                1,
-                slot_mapping,
-                None,
-                None,
-                state_indices=None,
-            )
-            mtp_hidden = self.model.mtp(current_positions, current_hidden, inputs_embeds)
-            draft_logits = self.model.compute_logits(mtp_hidden)
-            next_token_ids = self.sample(draft_logits, None, greedy=True)
-            next_token_tensor = torch.empty(current_hidden.size(0), dtype=torch.int64, device="cuda")
-            if self.rank == 0:
-                draft_token_ids.append(next_token_ids[0])
-                next_token_tensor.copy_(torch.tensor(next_token_ids, dtype=torch.int64, device="cuda"))
-            if self.world_size > 1:
-                dist.broadcast(next_token_tensor, src=0)
-            current_hidden = mtp_hidden
-            current_positions = current_positions + 1
-            current_token_tensor = next_token_tensor
-        reset_context()
-
-        if self.rank != 0:
-            return None
-        return {
-            "main_token_ids": main_token_ids,
-            "draft_token_ids": draft_token_ids,
-            "mtp_forwards": draft_len,
-        }
+        return self._run_mtp_draft(seqs, is_prefill=is_prefill, draft_len=draft_len)
 
     @torch.inference_mode()
     def capture_cudagraph(self):
