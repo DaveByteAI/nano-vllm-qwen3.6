@@ -45,6 +45,58 @@ What the profile says:
   and the CPU time (409 ms) is roughly twice the GPU time (212 ms).
 - **Batching is cheap.** Four concurrent requests cost only 20% more per step than one.
 
+## MTP Speculative Decode
+
+Qwen3.5/3.6 checkpoints ship one MTP (multi-token prediction) layer. With
+`--verify-mode parallel`, each round runs the MTP head to draft `k` tokens and then
+**one** target forward over `k + 1` tokens:
+
+1. The MTP layer keeps its own paged KV. Before drafting, it writes KV for the positions
+   accepted last round, using their target hidden states.
+2. Full attention and the MLP process all `k + 1` tokens at once, so the weights are read once.
+   GatedDeltaNet batches its projections and conv, runs the small recurrent update step
+   by step, and keeps every step's conv window and recurrent state in a verify buffer.
+   The state pool does not change during verify.
+3. After `j` drafts are accepted, the state after step `j` is copied into the pool (all
+   layers in one copy) and the target's bonus token is committed. No snapshot, restore
+   or rerun is needed.
+
+Verify (lengths 1-5) and MTP steps are captured as CUDA graphs.
+
+Qwen3.5-9B BF16 on one RTX 3090, batch 1, greedy, 512 generated tokens. Decode speed
+excludes prefill:
+
+| draft_len | Chinese explanation | English essay | Python code |
+|---|---|---|---|
+| baseline (no MTP) | 39.5 tok/s | 39.2 tok/s | 39.0 tok/s |
+| 1 | 58.5 | 55.4 | 58.6 |
+| 2 | 68.3 | **64.1** | 71.1 |
+| 3 | **71.4** | 62.0 | **76.9** |
+| 4 | 71.5 | 60.8 | 75.1 |
+
+That is **1.6-2.0x** decode speed. On these prompts the first draft is accepted
+78-88% of the time. Per-round costs: verify of 4 tokens is 27.9 ms (a 1-token step is
+22.5 ms), one MTP step is 3.1 ms (2.3 ms of it is the 248k-vocab `lm_head`), and the
+state commit is 0.13 ms.
+
+Output is not guaranteed to be bit-identical to plain greedy decode. Verifying `k + 1`
+tokens in one pass changes the bf16 accumulation order, which can flip a near-tied
+argmax. Every first divergence we checked had a top-1/top-2 logit gap of at most
+0.125, which is one bf16 step at that magnitude. The older `graph` verify mode stays
+greedy-identical but gives no speedup.
+
+```bash
+python run_mtp_fast_decode.py \
+  --model ~/huggingface/Qwen3.5-9B \
+  --devices 0 \
+  --tp 1 \
+  --draft-len 3 \
+  --verify-mode parallel \
+  --max-tokens 512 \
+  --max-model-len 2048 \
+  --compare-greedy
+```
+
 ## Optimization Roadmap
 
 <p align="center"><img src="assets/roadmap.svg" alt="Roadmap with estimated decode speed: today 41.4 tok/s measured; Triton chunk prefill leaves decode unchanged but cuts TTFT; fused GDN decode about 48 to 50 tok/s; INT8 weight-only about 80 tok/s; INT4 weight-only about 110 to 125 tok/s." width="100%"></p>
@@ -79,8 +131,8 @@ startup, which single-request tests do not need.
 - CUDA Graph decode when `enforce_eager=False`.
 - Rank-local FP8 checkpoint loading: each TP rank slices its shard and dequantizes only
   the shard it owns.
-- Experimental Qwen3.6 MTP weight loading, single-step forward probe, and MTP-1
-  draft/verify prototype.
+- MTP speculative decode with parallel verify (`run_mtp_fast_decode.py --verify-mode
+  parallel`): 1.6-2.0x decode speed for Qwen3.5-9B on one RTX 3090.
 
 ## Current Limitations
 
@@ -91,8 +143,10 @@ startup, which single-request tests do not need.
   does not fit in 24GB cards with the current BF16-resident implementation.
 - Loading Qwen3.6-27B-FP8 is slow because the original FP8 checkpoint is converted at
   startup. A pre-converted TP-sharded checkpoint would start faster.
-- MTP is currently a prototype for weight loading, one-step draft-token probing, and
-  MTP-1 accept-rate measurement. It does not provide decode speedup yet.
+- MTP speculative decode is driven by the benchmark scripts, not by `LLM.generate`. It
+  supports batch size 1 and greedy sampling only, and its output can differ from plain
+  greedy decode at near-tied tokens (see above). The parallel verify path has been
+  measured on Qwen3.5-9B with TP=1 only; TP>1 code paths exist but are untested.
 - This is not a production serving stack. It is a research/learning implementation.
 
 ## Repository Layout
@@ -242,7 +296,9 @@ This prototype groups draft verification into batch-level accept/reject accounti
 
 `--verify-mode chunk` is an experimental continuation-prefill verifier. It runs a chunk probe first, then restores the decode state and uses the trusted graph/eager verify path to make accept/reject and state-commit decisions so greedy output stays aligned. Chunk verify-length buckets 1-4 are captured as CUDA graphs when CUDA Graph is enabled. The raw chunk logits are still compared against the trusted path and may differ, so this mode is for studying chunk-verify semantics and overhead before a fused GDN chunk kernel.
 
-Fast-path MTP decode benchmark without top-k/logit-diff probes:
+Fast-path MTP decode benchmark without top-k/logit-diff probes. `parallel` is the
+default and the only mode that speeds up decode; `graph`, `eager` and `chunk` use the
+older sequential verify:
 
 ```bash
 python run_mtp_fast_decode.py \
@@ -250,7 +306,7 @@ python run_mtp_fast_decode.py \
   --devices 0,1,2,3 \
   --tp 4 \
   --draft-len 2 \
-  --verify-mode graph \
+  --verify-mode parallel \
   --max-tokens 128 \
   --compare-greedy
 ```
@@ -263,7 +319,7 @@ python bench_mtp_draft_sweep.py \
   --devices 0,1,2,3 \
   --tp 4 \
   --draft-lens 1,2,3,4 \
-  --verify-mode graph \
+  --verify-mode parallel \
   --max-tokens 128
 ```
 

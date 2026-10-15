@@ -113,6 +113,10 @@ class ModelRunner:
                 del self.verify_graphs, self.verify_graph_vars
             if hasattr(self, "verify_chunk_graphs"):
                 del self.verify_chunk_graphs, self.verify_chunk_graph_vars
+            if hasattr(self, "pverify_graphs"):
+                del self.pverify_graphs, self.pverify_graph_vars
+            if hasattr(self, "mtp_graphs"):
+                del self.mtp_graphs, self.mtp_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -209,10 +213,21 @@ class ModelRunner:
         assert max_slots > 0, f"Not enough GPU memory for GDN state slots (need {bytes_per_slot} bytes per slot, have {free} free)"
         config.max_state_slots = max_slots
 
-        # Allocate pools and assign to each GDN layer
-        for layer in gdn_layers:
-            layer.conv_states = torch.zeros(max_slots, conv_dim, kernel_size - 1, dtype=hf_config.dtype, device="cuda")
-            layer.recurrent_states = torch.zeros(max_slots, num_v_heads, head_k_dim, head_v_dim, dtype=torch.float32, device="cuda")
+        # Allocate one stacked pool and give each GDN layer its view, so a verify commit
+        # can update every layer with a single copy.
+        self.gdn_conv_states = torch.zeros(num_gdn, max_slots, conv_dim, kernel_size - 1, dtype=hf_config.dtype, device="cuda")
+        self.gdn_recurrent_states = torch.zeros(num_gdn, max_slots, num_v_heads, head_k_dim, head_v_dim, dtype=torch.float32, device="cuda")
+        if config.enable_mtp:
+            max_t = self.pverify_max_len
+            self.gdn_verify_conv_window = torch.zeros(num_gdn, conv_dim, kernel_size - 1 + max_t, dtype=hf_config.dtype, device="cuda")
+            self.gdn_verify_rec_states = torch.zeros(num_gdn, max_t, num_v_heads, head_k_dim, head_v_dim, dtype=torch.float32, device="cuda")
+        for i, layer in enumerate(gdn_layers):
+            layer.conv_states = self.gdn_conv_states[i]
+            layer.recurrent_states = self.gdn_recurrent_states[i]
+            if config.enable_mtp:
+                layer.verify_conv_window = self.gdn_verify_conv_window[i]
+                layer.verify_rec_states = self.gdn_verify_rec_states[i]
+        self.gdn_layers = gdn_layers
 
     def reset_gdn_state_slots(self, slot_ids: list[int]):
         if not self.config.is_hybrid or not slot_ids:
@@ -319,6 +334,19 @@ class ModelRunner:
             self.decode_cpu_state_indices = torch.empty(max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
             self.decode_gpu_state_indices = torch.empty(max_num_seqs, dtype=torch.int32, device="cuda")
         self.verify_graph_lens = [1, 2, 3, 4]
+        # Parallel verify runs draft_len + 1 tokens in one forward (draft_len <= 4).
+        self.pverify_lens = [1, 2, 3, 4, 5]
+        self.pverify_max_len = max(self.pverify_lens)
+        # Separate pinned staging for verify and MTP so back-to-back async copies never share memory.
+        self.pverify_stage, self.mtp_stage = [
+            dict(
+                positions=torch.empty(self.pverify_max_len, dtype=torch.int64, device="cpu", pin_memory=True),
+                slot_mapping=torch.empty(self.pverify_max_len, dtype=torch.int32, device="cpu", pin_memory=True),
+                context_lens=torch.empty(self.pverify_max_len, dtype=torch.int32, device="cpu", pin_memory=True),
+                block_tables=torch.empty(self.pverify_max_len, max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=True),
+            )
+            for _ in range(2)
+        ]
         max_verify_len = max(self.verify_graph_lens)
         self.verify_cpu_input_ids = torch.empty(max_verify_len, dtype=torch.int64, device="cpu", pin_memory=True)
         self.verify_cpu_positions = torch.empty(max_verify_len, dtype=torch.int64, device="cpu", pin_memory=True)
@@ -1390,6 +1418,223 @@ class ModelRunner:
     def run_mtp_draft_fast_step(self, seqs: list[Sequence], is_prefill: bool, draft_len: int = 1):
         return self._run_mtp_draft(seqs, is_prefill=is_prefill, draft_len=draft_len)
 
+    def _stage_rows(self, stage: dict, seq: Sequence, start_pos: int, num_rows: int):
+        """Fill pinned staging buffers for num_rows consecutive positions run as a decode batch."""
+        context_len = start_pos + num_rows
+        needed_blocks = (context_len + self.block_size - 1) // self.block_size
+        assert len(seq.block_table) >= needed_blocks, \
+            f"need KV blocks up to position {context_len - 1}; call ensure_block_capacity first"
+        for i in range(num_rows):
+            pos = start_pos + i
+            stage["positions"][i] = pos
+            stage["context_lens"][i] = pos + 1
+            stage["slot_mapping"][i] = (
+                seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size
+            )
+        block_tables_cpu = stage["block_tables"][:num_rows, :needed_blocks]
+        block_tables_cpu[:] = torch.tensor(seq.block_table[:needed_blocks], dtype=torch.int32)
+        return needed_blocks, block_tables_cpu
+
+    def _run_mtp_rows(
+        self,
+        seq: Sequence,
+        start_pos: int,
+        hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ):
+        """Decode-style MTP over a few consecutive positions (catch-up rows or one chain step).
+
+        Same row pairing as _run_mtp_cached, but each row attends through the decode
+        kernel with its own context length, so the call can replay a CUDA graph.
+        Returns the last row's MTP hidden state and logits.
+        """
+        num_rows = hidden_states.size(0)
+        stage = self.mtp_stage
+        needed_blocks, block_tables_cpu = self._stage_rows(stage, seq, start_pos, num_rows)
+        use_graph = not self.enforce_eager and num_rows in getattr(self, "mtp_graphs", {})
+        if use_graph:
+            vars = self.mtp_graph_vars[num_rows]
+            vars["hidden_states"].copy_(hidden_states)
+            vars["input_ids"].copy_(next_token_ids)
+            vars["positions"].copy_(stage["positions"][:num_rows], non_blocking=True)
+            vars["slot_mapping"].copy_(stage["slot_mapping"][:num_rows], non_blocking=True)
+            vars["context_lens"].copy_(stage["context_lens"][:num_rows], non_blocking=True)
+            vars["block_tables"].fill_(-1)
+            vars["block_tables"][:, :needed_blocks].copy_(block_tables_cpu, non_blocking=True)
+            self.mtp_graphs[num_rows].replay()
+            return vars["last_hidden"], vars["logits"]
+        positions = stage["positions"][:num_rows].cuda(non_blocking=True)
+        set_context(
+            False,
+            slot_mapping=stage["slot_mapping"][:num_rows].cuda(non_blocking=True),
+            context_lens=stage["context_lens"][:num_rows].cuda(non_blocking=True),
+            block_tables=block_tables_cpu.cuda(non_blocking=True),
+        )
+        inputs_embeds = self.model.model.embed_tokens(next_token_ids)
+        mtp_hidden = self.model.mtp(positions, hidden_states, inputs_embeds)
+        last_hidden = mtp_hidden[-1:].contiguous()
+        logits = self.model.compute_logits(last_hidden)
+        reset_context()
+        return last_hidden, logits
+
+    def _run_parallel_verify(self, seq: Sequence, input_token_ids: torch.Tensor, start_pos: int):
+        """One target forward over input_token_ids at positions start_pos.. of one sequence.
+
+        Full attention runs the tokens as a decode batch (token i sees positions
+        <= start_pos + i); GDN layers keep per-step states in verify buffers and leave
+        the state pool untouched until commit. Returns hidden states [T, H].
+        """
+        verify_len = input_token_ids.size(0)
+        stage = self.pverify_stage
+        needed_blocks, block_tables_cpu = self._stage_rows(stage, seq, start_pos, verify_len)
+
+        use_graph = not self.enforce_eager and verify_len in getattr(self, "pverify_graphs", {})
+        if use_graph:
+            vars = self.pverify_graph_vars[verify_len]
+            input_ids = vars["input_ids"]
+            positions = vars["positions"]
+            slot_mapping = vars["slot_mapping"]
+            context_lens = vars["context_lens"]
+            block_tables = vars["block_tables"]
+            state_indices = vars["state_indices"]
+            block_tables.fill_(-1)
+            block_tables = block_tables[:, :needed_blocks]
+        else:
+            input_ids = torch.empty(verify_len, dtype=torch.int64, device="cuda")
+            positions = torch.empty(verify_len, dtype=torch.int64, device="cuda")
+            slot_mapping = torch.empty(verify_len, dtype=torch.int32, device="cuda")
+            context_lens = torch.empty(verify_len, dtype=torch.int32, device="cuda")
+            block_tables = torch.empty(verify_len, needed_blocks, dtype=torch.int32, device="cuda")
+            state_indices = torch.empty(1, dtype=torch.int32, device="cuda")
+        input_ids.copy_(input_token_ids)
+        positions.copy_(stage["positions"][:verify_len], non_blocking=True)
+        slot_mapping.copy_(stage["slot_mapping"][:verify_len], non_blocking=True)
+        context_lens.copy_(stage["context_lens"][:verify_len], non_blocking=True)
+        block_tables.copy_(block_tables_cpu, non_blocking=True)
+        state_indices.fill_(seq.state_slot_id)
+
+        if use_graph:
+            self.pverify_graphs[verify_len].replay()
+            return vars["outputs"][:verify_len]
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            state_indices=state_indices,
+            verify=True,
+        )
+        hidden_states = self.model(input_ids, positions)
+        reset_context()
+        return hidden_states
+
+    def _commit_gdn_verify(self, state_slot_id: int, num_consumed: int):
+        """Keep every GDN layer's state after the first num_consumed verify tokens."""
+        k1 = self.gdn_conv_states.size(-1)
+        self.gdn_conv_states[:, state_slot_id].copy_(self.gdn_verify_conv_window[:, :, num_consumed:num_consumed + k1])
+        self.gdn_recurrent_states[:, state_slot_id].copy_(self.gdn_verify_rec_states[:, num_consumed - 1])
+
+    def _greedy_token_tensor(self, logits: torch.Tensor) -> torch.Tensor:
+        """Greedy tokens as a device tensor identical on all ranks."""
+        token_ids = self.sample(logits, None, greedy=True)
+        return self._broadcast_token_ids(token_ids, logits.size(0))
+
+    @torch.inference_mode()
+    def run_spec_prefill(self, seqs: list[Sequence]):
+        """Prefill for parallel speculative decode.
+
+        Writes MTP KV for every prompt row whose next token is known; the final prompt
+        row is left pending so the first spec round pairs it with the sampled token.
+        """
+        assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
+        assert len(seqs) == 1, "spec decode currently supports batch size 1"
+        seq = seqs[0]
+        input_ids, positions, pixel_values, image_grid_thw, image_token_mask = self.prepare_prefill(seqs)
+        assert pixel_values is None and image_grid_thw is None and image_token_mask is None, \
+            "spec decode is text-only"
+        start_pos = min(seq.num_cached_tokens, len(seq) - 1)
+        final_chunk = start_pos + seq.num_scheduled_tokens >= len(seq)
+        hidden_states = self.model(input_ids, positions)
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = self.sample(logits, None, greedy=True)
+        reset_context()
+
+        if start_pos == 0:
+            self.mtp_kv_end = 0
+        num_known = hidden_states.size(0) - int(final_chunk)
+        if num_known:
+            next_ids = None
+            if self.rank == 0:
+                next_ids = list(seq.token_ids[start_pos + 1:start_pos + num_known + 1])
+            self._run_mtp_cached(
+                seq, start_pos, hidden_states[:num_known], self._broadcast_token_ids(next_ids, num_known)
+            )
+            self.mtp_kv_end = start_pos + num_known
+        if final_chunk:
+            self._stash_mtp_hidden(start_pos + num_known, hidden_states[num_known:])
+        return token_ids
+
+    @torch.inference_mode()
+    def run_spec_round(self, seqs: list[Sequence], draft_len: int):
+        """One speculative round: MTP drafts, one parallel target verify, state commit.
+
+        The sequence's last token is not yet processed by the target model. Returns the
+        tokens to commit: the accepted drafts plus the target's bonus token.
+        """
+        assert getattr(self.model, "mtp", None) is not None, "MTP is not enabled"
+        assert len(seqs) == 1, "spec decode currently supports batch size 1"
+        assert 0 <= draft_len < self.pverify_max_len
+        seq = seqs[0]
+        cur_pos = len(seq) - 1
+
+        # 1. MTP catch-up over target hidden states verified last round, then chain drafts.
+        pending = self.mtp_pending_hidden
+        assert pending is not None and self.mtp_pending_start == self.mtp_kv_end \
+            and self.mtp_pending_start + pending.size(0) == cur_pos, "MTP KV is out of sync"
+        start_pos = self.mtp_pending_start
+        num_rows = pending.size(0)
+        next_ids = None
+        if self.rank == 0:
+            next_ids = list(seq.token_ids[start_pos + 1:start_pos + num_rows + 1])
+        mtp_hidden, draft_logits = self._run_mtp_rows(
+            seq, start_pos, pending, self._broadcast_token_ids(next_ids, num_rows)
+        )
+        self.mtp_kv_end = cur_pos
+        self.mtp_pending_hidden = None
+
+        last_token = torch.empty(1, dtype=torch.int64, device="cuda")
+        if self.rank == 0:
+            last_token.fill_(seq.last_token)
+        if self.world_size > 1:
+            dist.broadcast(last_token, src=0)
+        verify_inputs = [last_token]
+        for i in range(draft_len):
+            draft_token = self._greedy_token_tensor(draft_logits)
+            verify_inputs.append(draft_token)
+            if i != draft_len - 1:
+                mtp_hidden, draft_logits = self._run_mtp_rows(seq, cur_pos + i, mtp_hidden, draft_token)
+        verify_input_ids = torch.cat(verify_inputs)                    # [x_n, d_1 .. d_k]
+
+        # 2. Parallel verify: target token i predicts position cur_pos + i + 1.
+        hidden_states = self._run_parallel_verify(seq, verify_input_ids, cur_pos)
+        target_ids = self._greedy_token_tensor(self.model.compute_logits(hidden_states))
+
+        # 3. Accept the longest matching draft prefix, plus the target's bonus token.
+        matches = (verify_input_ids[1:] == target_ids[:-1]).int()
+        accept_len = int(matches.cumprod(0).sum().item()) if draft_len else 0
+        if self.config.is_hybrid:
+            self._commit_gdn_verify(seq.state_slot_id, accept_len + 1)
+        self._stash_mtp_hidden(cur_pos, hidden_states[:accept_len + 1])
+
+        if self.rank != 0:
+            return None
+        verify_list = verify_input_ids.tolist()
+        return {
+            "token_ids": verify_list[1:accept_len + 1] + [int(target_ids[accept_len].item())],
+            "accept_len": accept_len,
+            "draft_len": draft_len,
+        }
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
@@ -1444,6 +1689,8 @@ class ModelRunner:
         if config.enable_mtp:
             self.capture_verify_cudagraph()
             self.capture_verify_chunk_cudagraph()
+            self.capture_parallel_verify_cudagraph()
+            self.capture_mtp_cudagraph()
 
     @torch.inference_mode()
     def capture_verify_cudagraph(self):
@@ -1544,3 +1791,88 @@ class ModelRunner:
             reset_context()
             if config.is_hybrid:
                 self.reset_gdn_state_slots([0])
+
+    @torch.inference_mode()
+    def capture_parallel_verify_cudagraph(self):
+        config = self.config
+        hf_config = config.hf_config
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        self.pverify_graphs = {}
+        self.pverify_graph_vars = {}
+
+        for verify_len in self.pverify_lens:
+            input_ids = torch.zeros(verify_len, dtype=torch.int64)
+            positions = torch.arange(verify_len, dtype=torch.int64)
+            slot_mapping = torch.arange(verify_len, dtype=torch.int32)
+            context_lens = torch.arange(1, verify_len + 1, dtype=torch.int32)
+            block_tables = torch.zeros(verify_len, max_num_blocks, dtype=torch.int32)
+            state_indices = torch.zeros(1, dtype=torch.int32)
+            outputs = torch.zeros(verify_len, hf_config.hidden_size)
+
+            def run_parallel_verify():
+                set_context(
+                    False,
+                    slot_mapping=slot_mapping,
+                    context_lens=context_lens,
+                    block_tables=block_tables,
+                    state_indices=state_indices,
+                    verify=True,
+                )
+                outputs[:] = self.model(input_ids, positions)
+
+            run_parallel_verify()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                run_parallel_verify()
+            self.pverify_graphs[verify_len] = graph
+            self.pverify_graph_vars[verify_len] = dict(
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                state_indices=state_indices,
+                outputs=outputs,
+            )
+            torch.cuda.synchronize()
+            reset_context()
+
+    @torch.inference_mode()
+    def capture_mtp_cudagraph(self):
+        config = self.config
+        hf_config = config.hf_config
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        self.mtp_graphs = {}
+        self.mtp_graph_vars = {}
+
+        for num_rows in self.pverify_lens:
+            hidden_states = torch.zeros(num_rows, hf_config.hidden_size)
+            input_ids = torch.zeros(num_rows, dtype=torch.int64)
+            positions = torch.arange(num_rows, dtype=torch.int64)
+            slot_mapping = torch.arange(num_rows, dtype=torch.int32)
+            context_lens = torch.arange(1, num_rows + 1, dtype=torch.int32)
+            block_tables = torch.zeros(num_rows, max_num_blocks, dtype=torch.int32)
+            vars = dict(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+            )
+
+            def run_mtp():
+                set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+                inputs_embeds = self.model.model.embed_tokens(input_ids)
+                mtp_hidden = self.model.mtp(positions, hidden_states, inputs_embeds)
+                vars["last_hidden"] = mtp_hidden[-1:].contiguous()
+                vars["logits"] = self.model.compute_logits(vars["last_hidden"])
+
+            run_mtp()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.graph_pool):
+                run_mtp()
+            self.mtp_graphs[num_rows] = graph
+            self.mtp_graph_vars[num_rows] = vars
+            torch.cuda.synchronize()
+            reset_context()

@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument("--max-batched-tokens", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--draft-lens", default="1,2,3,4")
-    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk"], default="graph")
+    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk", "parallel"], default="parallel")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--skip-greedy-compare", action="store_true")
     return parser.parse_args()

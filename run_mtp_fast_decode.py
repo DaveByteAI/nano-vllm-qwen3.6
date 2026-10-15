@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--max-batched-tokens", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--draft-len", type=int, default=2)
-    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk"], default="graph")
+    parser.add_argument("--verify-mode", choices=["eager", "graph", "chunk", "parallel"], default="parallel")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--compare-greedy", action="store_true")
     parser.add_argument("--hide-text", action="store_true")
@@ -89,7 +89,8 @@ def run_greedy_decode(args, prompt):
         seqs, is_prefill = llm.scheduler.schedule()
         call_started = perf_counter()
         token_ids = llm.model_runner.call("run", seqs, is_prefill)
-        stats["model_call_seconds"] += perf_counter() - call_started
+        if not is_prefill:    # decode speed excludes prefill
+            stats["model_call_seconds"] += perf_counter() - call_started
         stats["target_forwards"] += 1
         llm.scheduler.postprocess(seqs, token_ids, is_prefill)
     stats["wall_seconds"] = perf_counter() - started
@@ -98,8 +99,65 @@ def run_greedy_decode(args, prompt):
     return token_ids, stats
 
 
+def run_mtp_parallel_decode(args, prompt):
+    """One target forward per round: MTP drafts k tokens, verify runs k + 1 tokens at once."""
+    from nanovllm import SamplingParams
+
+    llm = create_llm(args, enable_mtp=True, enforce_eager=False)
+    llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))
+    seq = llm.scheduler.waiting[-1]
+    stats = {
+        "draft_rounds": 0,
+        "draft_token_attempts": 0,
+        "accepted_tokens": 0,
+        "accept_length_total": 0,
+        "verify_batches": 0,
+        "target_forwards": 0,
+        "mtp_forwards": 0,
+        "prefill_call_seconds": 0.0,
+        "round_call_seconds": 0.0,
+    }
+
+    started = perf_counter()
+    while not llm.is_finished() and seq.num_completion_tokens == 0:
+        seqs, is_prefill = llm.scheduler.schedule()
+        assert is_prefill
+        call_started = perf_counter()
+        token_ids = llm.model_runner.call("run_spec_prefill", seqs)
+        stats["prefill_call_seconds"] += perf_counter() - call_started
+        llm.scheduler.postprocess(seqs, token_ids, True)
+
+    while not llm.is_finished():
+        remaining = args.max_tokens - seq.num_completion_tokens
+        round_draft_len = max(0, min(args.draft_len, remaining - 1))
+        # Verify writes target KV at len(seq) - 1 .. len(seq) - 1 + draft_len.
+        ensure_block_capacity(llm, seq, len(seq) + round_draft_len)
+        call_started = perf_counter()
+        result = llm.model_runner.call("run_spec_round", [seq], round_draft_len)
+        stats["round_call_seconds"] += perf_counter() - call_started
+        stats["target_forwards"] += 1
+        stats["mtp_forwards"] += max(round_draft_len, 1)
+        stats["verify_batches"] += int(round_draft_len > 0)
+        stats["draft_rounds"] += int(round_draft_len > 0)
+        stats["draft_token_attempts"] += round_draft_len
+        stats["accepted_tokens"] += result["accept_len"]
+        stats["accept_length_total"] += result["accept_len"]
+        commit_tokens(llm, seq, result["token_ids"])
+
+    stats["wall_seconds"] = perf_counter() - started
+    # Decode speed excludes prefill so it compares with the greedy decode baseline.
+    stats["model_call_seconds"] = stats["round_call_seconds"]
+    stats["compared_tokens"] = stats["draft_token_attempts"]
+    token_ids = list(seq.completion_token_ids)
+    close_llm(llm)
+    return token_ids, stats
+
+
 def run_mtp_fast_decode(args, prompt):
     from nanovllm import SamplingParams
+
+    if args.verify_mode == "parallel":
+        return run_mtp_parallel_decode(args, prompt)
 
     llm = create_llm(args, enable_mtp=True, enforce_eager=args.verify_mode == "eager")
     llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=args.max_tokens))

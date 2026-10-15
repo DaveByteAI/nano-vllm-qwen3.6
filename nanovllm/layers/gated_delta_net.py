@@ -177,6 +177,9 @@ class GatedDeltaNet(nn.Module):
         # State pools — allocated by model_runner after init
         self.conv_states: torch.Tensor = torch.tensor([])
         self.recurrent_states: torch.Tensor = torch.tensor([])
+        # Parallel verify buffers — allocated by model_runner when MTP is enabled
+        self.verify_conv_window: torch.Tensor = torch.tensor([])   # [D, K-1+T_max]
+        self.verify_rec_states: torch.Tensor = torch.tensor([])    # [T_max, Hv, Dk, Dv]
 
     def qkv_weight_loader(
         self,
@@ -374,9 +377,68 @@ class GatedDeltaNet(nn.Module):
         out = self.out_proj(out.reshape(B, 1, self.value_dim)).squeeze(1)
         return out
 
+    def _forward_verify(self, hidden_states):
+        """Verify T speculative tokens of one sequence without touching the state pool.
+
+        Projections and conv run over all T tokens at once; the small recurrent update
+        stays sequential. The conv window and the recurrent state after every step are
+        kept in verify buffers so commit_verify can keep any accepted prefix.
+        """
+        context = get_context()
+        state_indices = context.state_indices                   # [1]
+        T = hidden_states.size(0)
+        K1 = self.conv_kernel_size - 1
+
+        x = hidden_states.unsqueeze(0)                          # [1, T, H]
+        mixed_qkv = self.in_proj_qkv(x)                         # [1, T, D]
+        z = self.in_proj_z(x)                                   # [1, T, Dv]
+        b = self.in_proj_b(x)                                   # [1, T, Hv]
+        a = self.in_proj_a(x)                                   # [1, T, Hv]
+
+        # Causal conv over [old conv state | new tokens], same arithmetic as decode.
+        window = self.verify_conv_window[:, :K1 + T]
+        window[:, :K1] = self.conv_states[state_indices][0]
+        window[:, K1:] = mixed_qkv[0].t()
+        weight = self.conv1d.weight.squeeze(1)                  # [D, K]
+        mixed_qkv = (window.unfold(-1, K1 + 1, 1) * weight.unsqueeze(1)).sum(dim=-1)    # [D, T]
+        mixed_qkv = F.silu(mixed_qkv).t().unsqueeze(0)          # [1, T, D]
+
+        q, k, v = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(1, T, self.num_k_heads, self.head_k_dim)
+        k = k.reshape(1, T, self.num_k_heads, self.head_k_dim)
+        v = v.reshape(1, T, self.num_v_heads, self.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self.gqa_ratio > 1:
+            q = q.repeat_interleave(self.gqa_ratio, dim=2)
+            k = k.repeat_interleave(self.gqa_ratio, dim=2)
+
+        prev = self.recurrent_states[state_indices]             # [1, Hv, Dk, Dv] copy
+        outs = []
+        for t in range(T):
+            cur = self.verify_rec_states[t:t + 1]
+            cur.copy_(prev)
+            outs.append(recurrent_gated_delta_rule(
+                q[:, t:t + 1], k[:, t:t + 1], v[:, t:t + 1], g[:, t:t + 1], beta[:, t:t + 1], cur,
+            ))
+            prev = cur
+        out = torch.cat(outs, dim=1)                            # [1, T, Hv, Dv]
+
+        z_flat = z.reshape(-1, self.head_v_dim)
+        out = self.norm(out.reshape(-1, self.head_v_dim), z_flat)
+        return self.out_proj(out.reshape(1, T, self.value_dim)).squeeze(0)
+
+    def commit_verify(self, state_index: int, num_consumed: int):
+        """Keep the state after the first num_consumed verify tokens."""
+        K1 = self.conv_kernel_size - 1
+        self.conv_states[state_index].copy_(self.verify_conv_window[:, num_consumed:num_consumed + K1])
+        self.recurrent_states[state_index].copy_(self.verify_rec_states[num_consumed - 1])
+
     def forward(self, hidden_states):
         context = get_context()
         if context.is_prefill:
             return self._forward_prefill(hidden_states)
-        else:
-            return self._forward_decode(hidden_states)
+        if context.verify:
+            return self._forward_verify(hidden_states)
+        return self._forward_decode(hidden_states)

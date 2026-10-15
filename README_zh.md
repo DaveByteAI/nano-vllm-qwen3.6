@@ -42,6 +42,50 @@ flash-attn 2.8.3，batch 1，贪心解码：
   大约是 GPU 耗时（212 ms）的两倍。
 - **组 batch 很便宜。** 4 条请求并发时，每步只比单条慢 20%。
 
+## MTP 投机解码
+
+Qwen3.5/3.6 的权重自带一层 MTP（多 token 预测）。使用 `--verify-mode parallel` 时，
+每轮先用 MTP 头生成 `k` 个草稿 token，然后对 `k + 1` 个 token 只做**一次**目标模型前向：
+
+1. MTP 层有自己的分页 KV。生成草稿前，先用上一轮已接受位置的目标 hidden state 把这些位置的 KV 补写进去。
+2. 全注意力和 MLP 一次处理全部 `k + 1` 个 token，权重只读一遍。GatedDeltaNet 的投影和
+   conv 批量计算，递推状态的小更新逐步进行，每一步的 conv 窗口和递推状态都存进
+   验证缓冲区。验证期间状态池不变。
+3. 接受 `j` 个草稿后，把第 `j` 步之后的状态拷回状态池（所有层一次拷完），并提交目标模型
+   给出的 bonus token。不需要快照、恢复或重跑。
+
+验证（长度 1–5）和 MTP 步骤都录制成了 CUDA Graph。
+
+单张 RTX 3090 上的 Qwen3.5-9B BF16，batch 1，贪心解码，生成 512 token。解码速度不含 prefill：
+
+| draft_len | 中文讲解 | 英文长文 | Python 代码 |
+|---|---|---|---|
+| 基线（不开 MTP） | 39.5 tok/s | 39.2 tok/s | 39.0 tok/s |
+| 1 | 58.5 | 55.4 | 58.6 |
+| 2 | 68.3 | **64.1** | 71.1 |
+| 3 | **71.4** | 62.0 | **76.9** |
+| 4 | 71.5 | 60.8 | 75.1 |
+
+即解码速度提升 **1.6–2.0 倍**。在这几条 prompt 上，第一个草稿的接受率为 78–88%。
+每轮各部分耗时：4 个 token 的验证 27.9 ms（单 token 一步 22.5 ms），一次 MTP 3.1 ms
+（其中 2.3 ms 是 24.8 万词表的 `lm_head`），状态提交 0.13 ms。
+
+输出不保证与普通贪心解码逐位一致。一次验证 `k + 1` 个 token 会改变 bf16 的累加顺序，
+可能翻转几乎打平的 argmax。我们检查过的每个首个分叉点，top-1 与 top-2 的 logit 差都
+不超过 0.125，即该量级下 bf16 的一个最小刻度。旧的 `graph` 验证模式与贪心结果一致，但没有加速。
+
+```bash
+python run_mtp_fast_decode.py \
+  --model ~/huggingface/Qwen3.5-9B \
+  --devices 0 \
+  --tp 1 \
+  --draft-len 3 \
+  --verify-mode parallel \
+  --max-tokens 512 \
+  --max-model-len 2048 \
+  --compare-greedy
+```
+
 ## 优化路线
 
 <p align="center"><img src="assets/roadmap_zh.svg" alt="优化路线及估算解码速度：现状 41.4 tok/s（实测）；prefill 换 Triton chunk kernel 不改变解码速度，但缩短首 token 时间；融合 GDN 解码约 48–50 tok/s；INT8 仅权重量化约 80 tok/s；INT4 仅权重量化约 110–125 tok/s。" width="100%"></p>
@@ -72,7 +116,7 @@ flash-attn 2.8.3，batch 1，贪心解码：
 - 注意力、MLP、词表 embedding/head、GatedDeltaNet 的张量并行。
 - `enforce_eager=False` 时使用 CUDA Graph 解码。
 - 按 rank 加载 FP8 权重：每个 TP rank 只切出并反量化自己负责的那一片。
-- 实验性的 Qwen3.6 MTP：权重加载、单步前向探测、MTP-1 草稿/验证原型。
+- 带并行验证的 MTP 投机解码（`run_mtp_fast_decode.py --verify-mode parallel`）：单张 RTX 3090 上 Qwen3.5-9B 解码提速 1.6–2.0 倍。
 
 ## 当前限制
 
@@ -81,7 +125,7 @@ flash-attn 2.8.3，batch 1，贪心解码：
 - Qwen3.6-27B-FP8 在 4 × RTX 4090 上以 `tensor_parallel_size=4` 验证过。按当前
   BF16 常驻的实现，TP=2 在 24GB 显卡上放不下。
 - 加载 Qwen3.6-27B-FP8 比较慢，因为启动时要转换原始 FP8 权重。预先转换好、按 TP 切分的权重会启动得更快。
-- MTP 目前只是原型，用于权重加载、单步草稿 token 探测和 MTP-1 接受率测量，还不能带来解码加速。
+- MTP 投机解码目前由 benchmark 脚本驱动，没有接入 `LLM.generate`；只支持 batch size 1 和贪心采样，在几乎打平的 token 上输出可能与普通贪心解码不同（见上文）。并行验证只在 Qwen3.5-9B、TP=1 下实测过，TP>1 的代码路径已写好但未测试。
 - 这不是生产级服务框架，而是用于研究和学习的实现。
 
 ## 目录结构
@@ -229,7 +273,7 @@ python test_mtp_spec_decode.py \
 
 `--verify-mode chunk` 是实验性的续写式 prefill 验证器。它先跑一次分块探测，然后恢复解码状态，再用可信的 graph/eager 验证路径做接受/拒绝和状态提交，保证贪心输出对齐。启用 CUDA Graph 时，分块验证长度 1–4 也会录制成 CUDA Graph。原始分块 logits 仍会和可信路径对比，可能存在差异，所以这个模式用于在写融合 GDN 分块 kernel 之前研究分块验证的语义和开销。
 
-不带 top-k/logit 差异探测的快速 MTP 解码 benchmark：
+不带 top-k/logit 差异探测的快速 MTP 解码 benchmark。`parallel` 是默认模式，也是唯一能加速解码的模式；`graph`、`eager`、`chunk` 用的是旧的逐步验证：
 
 ```bash
 python run_mtp_fast_decode.py \
@@ -237,7 +281,7 @@ python run_mtp_fast_decode.py \
   --devices 0,1,2,3 \
   --tp 4 \
   --draft-len 2 \
-  --verify-mode graph \
+  --verify-mode parallel \
   --max-tokens 128 \
   --compare-greedy
 ```
@@ -250,7 +294,7 @@ python bench_mtp_draft_sweep.py \
   --devices 0,1,2,3 \
   --tp 4 \
   --draft-lens 1,2,3,4 \
-  --verify-mode graph \
+  --verify-mode parallel \
   --max-tokens 128
 ```
 
